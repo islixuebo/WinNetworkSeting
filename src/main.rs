@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+pub mod winutil;
+
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
@@ -20,9 +22,8 @@ pub fn resource_id(id: u32) -> PCWSTR {
 }
 
 /// 失败诊断走 OutputDebugStringW（src/ 内禁止 unwrap/expect/panic，失败只让外部可见）。
-/// Task 2 落地后这里的宽字符转换可换成 winutil::wide。
 fn report_failure(message: &str) {
-    let utf16: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    let utf16 = winutil::wide(message);
     unsafe { OutputDebugStringW(PCWSTR(utf16.as_ptr())) };
 }
 
