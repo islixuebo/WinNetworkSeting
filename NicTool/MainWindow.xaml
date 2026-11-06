@@ -1,0 +1,98 @@
+﻿<ui:FluentWindow x:Class="NicTool.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+        Title="网卡管理工具" Height="480" Width="920"
+        ExtendsContentIntoTitleBar="True"
+        WindowBackdropType="Mica"
+        WindowStartupLocation="CenterScreen" Loaded="OnLoaded">
+    <Grid Margin="20,0,20,12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <ui:TitleBar Grid.Row="0" Title="网络连接"/>
+
+        <Grid Grid.Row="1" Margin="0,4,0,10">
+            <TextBlock Text="网卡管理" FontSize="24" FontWeight="SemiBold"
+                       HorizontalAlignment="Left" VerticalAlignment="Center"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                <ui:Button x:Name="RefreshButton" Content="刷新" Margin="0,0,10,0"
+                           Icon="{ui:SymbolIcon ArrowSync24}" Click="OnRefresh"/>
+                <ui:Button x:Name="EnableButton" Content="启用" Margin="0,0,10,0"
+                           Icon="{ui:SymbolIcon Play24}" Appearance="Success"
+                           IsEnabled="False" Click="OnEnable"/>
+                <ui:Button x:Name="DisableButton" Content="禁用"
+                           Icon="{ui:SymbolIcon Pause24}" Appearance="Caution"
+                           IsEnabled="False" Click="OnDisable"/>
+            </StackPanel>
+        </Grid>
+
+        <Border Grid.Row="2" CornerRadius="8" Background="#FAFAFA"
+                BorderBrush="#E5E5E5" BorderThickness="1">
+            <ListView x:Name="NicList" BorderThickness="0" Background="Transparent"
+                      Padding="0" Margin="2"
+                      ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                      SelectionChanged="OnSelectionChanged"
+                      PreviewMouseRightButtonDown="OnListRightClick">
+                <ListView.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem Header="启用" Icon="{ui:SymbolIcon Play24}" Click="OnEnable"
+                                  IsEnabled="{Binding PlacementTarget.SelectedItem.CanEnable,
+                                    RelativeSource={RelativeSource Mode=FindAncestor, AncestorType={x:Type ContextMenu}}}"/>
+                        <MenuItem Header="禁用" Icon="{ui:SymbolIcon Pause24}" Click="OnDisable"
+                                  IsEnabled="{Binding PlacementTarget.SelectedItem.CanDisable,
+                                    RelativeSource={RelativeSource Mode=FindAncestor, AncestorType={x:Type ContextMenu}}}"/>
+                        <Separator/>
+                        <MenuItem Header="详细信息" Icon="{ui:SymbolIcon Info24}" Click="OnDetails"/>
+                    </ContextMenu>
+                </ListView.ContextMenu>
+                <ListView.GroupStyle>
+                    <GroupStyle>
+                        <GroupStyle.HeaderTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" FontSize="13"
+                                           Margin="6,10,0,4" Opacity="0.75"/>
+                            </DataTemplate>
+                        </GroupStyle.HeaderTemplate>
+                    </GroupStyle>
+                </ListView.GroupStyle>
+                <ListView.View>
+                    <GridView>
+                        <GridViewColumn Header="状态" Width="130">
+                            <GridViewColumn.CellTemplate>
+                                <DataTemplate>
+                                    <Border CornerRadius="10" Padding="9,3" Margin="0,2" HorizontalAlignment="Left">
+                                        <Border.Style>
+                                            <Style TargetType="Border">
+                                                <Setter Property="Background" Value="#ECECEC"/>
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsEnabled}" Value="True">
+                                                        <Setter Property="Background" Value="#DCEBFB"/>
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding IsConnected}" Value="True">
+                                                        <Setter Property="Background" Value="#D5F2DD"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </Border.Style>
+                                        <TextBlock Text="{Binding StatusText}" FontSize="12"/>
+                                    </Border>
+                                </DataTemplate>
+                            </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="名称" DisplayMemberBinding="{Binding Name}" Width="220"/>
+                        <GridViewColumn Header="IPv4" DisplayMemberBinding="{Binding Ipv4}" Width="130"/>
+                        <GridViewColumn Header="子网掩码" DisplayMemberBinding="{Binding SubnetMask}" Width="130"/>
+                        <GridViewColumn Header="网关" DisplayMemberBinding="{Binding Gateway}" Width="130"/>
+                    </GridView>
+                </ListView.View>
+            </ListView>
+        </Border>
+
+        <TextBlock x:Name="StatusText" Grid.Row="3" Margin="4,10,0,0" FontSize="12" Opacity="0.65"/>
+    </Grid>
+</ui:FluentWindow>
