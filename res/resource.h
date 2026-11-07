@@ -10,6 +10,7 @@
 #define IDC_DISABLE     1002
 #define IDC_REFRESH     1003
 #define IDC_FLUSH_DNS   1004
+#define IDC_DETAIL      1005
 
 #define IDM_ENABLE      2000
 #define IDM_DISABLE     2001

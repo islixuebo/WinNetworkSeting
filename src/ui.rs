@@ -36,6 +36,7 @@ pub const IDC_ENABLE: u32 = 1001;
 pub const IDC_DISABLE: u32 = 1002;
 pub const IDC_REFRESH: u32 = 1003;
 pub const IDC_FLUSH_DNS: u32 = 1004;
+pub const IDC_DETAIL: u32 = 1005;
 pub const IDC_STATUSBAR: u32 = 3000;
 pub const IDM_ENABLE: u32 = 2000;
 pub const IDM_DISABLE: u32 = 2001;
@@ -380,6 +381,15 @@ pub unsafe fn sync_buttons(hwnd: HWND, hl: HWND) {
     }
 }
 
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn open_detail(hwnd: HWND) {
+    match selected_nic(list_view(hwnd)) {
+        Some(n) => crate::detail::show(hwnd, &n),
+        None => set_status(hwnd, "未选择网卡"),
+    }
+}
+
 /// 在光标处弹出启用/禁用菜单。不带 TPM_RETURNCMD：选中项由系统以 WM_COMMAND
 /// 投给 owner 对话框，与按钮走同一条分发路径。
 ///
@@ -397,6 +407,7 @@ pub unsafe fn show_popup_menu(hwnd: HWND, hl: HWND) {
     let menus = [
         (IDM_ENABLE, "启用", has_sel && !en_state),
         (IDM_DISABLE, "禁用", has_sel && en_state),
+        (IDM_DETAIL, "详细信息", has_sel),
     ];
     for (id, label, usable) in menus {
         let flags = if usable {
@@ -620,7 +631,8 @@ pub unsafe extern "system" fn main_dlgproc(
                 }
                 IDC_ENABLE | IDM_ENABLE => on_toggle(hwnd, hl, true),
                 IDC_DISABLE | IDM_DISABLE => on_toggle(hwnd, hl, false),
-                // 刷新 DNS 缓存、详细信息由 Task 7/阶段2 接线
+                IDC_DETAIL | IDM_DETAIL => open_detail(hwnd),
+                // 刷新 DNS 缓存由阶段2 接线
                 _ => return 0,
             }
             1

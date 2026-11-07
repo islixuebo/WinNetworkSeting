@@ -20,6 +20,7 @@ BEGIN
     PUSHBUTTON "禁用",           IDC_DISABLE,   52,  5, 45, 14, WS_DISABLED
     PUSHBUTTON "刷新",           IDC_REFRESH,   99,  5, 45, 14
     PUSHBUTTON "刷新 DNS 缓存",  IDC_FLUSH_DNS, 146, 5, 72, 14
+    PUSHBUTTON "详细信息",       IDC_DETAIL,    220, 5, 50, 14
     CONTROL "", IDC_LIST, "SysListView32",
         LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,
         5, 24, 440, 170
