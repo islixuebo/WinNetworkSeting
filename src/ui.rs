@@ -6,27 +6,31 @@ use crate::netinfo::{self, Nic};
 use crate::winutil::wide;
 use std::sync::{Mutex, OnceLock};
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT,
     CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, ICC_BAR_CLASSES,
     ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVGF_GROUPID,
-    LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_TEXT, LVITEMW, LVNI_SELECTED, LVM_DELETEALLITEMS,
+    LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS,
     LVM_ENABLEGROUPVIEW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW,
-    LVM_REMOVEALLGROUPS, LVM_SETITEMTEXTW, LVN_ITEMCHANGED, NMHDR, NM_CUSTOMDRAW, NMLVCUSTOMDRAW,
-    SB_SETPARTS, SB_SETTEXTW,
+    LVM_REMOVEALLGROUPS, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED,
+    LVN_ITEMCHANGED, LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, SB_SETPARTS,
+    SB_SETTEXTW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos,
-    GetDlgItem, GetWindowRect, IDYES, MessageBoxW, MoveWindow, SendMessageW, TrackPopupMenu,
-    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING,
-    TPM_LEFTALIGN, TPM_TOPALIGN, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_INITDIALOG, WM_NOTIFY,
-    WM_SIZE,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, GetDlgItem,
+    GetSystemMetrics, GetWindowRect, LoadImageW, MessageBoxW, MoveWindow, SendMessageW,
+    TrackPopupMenu, ICON_BIG, ICON_SMALL, IDYES, IMAGE_ICON, LR_SHARED, MB_ICONERROR,
+    MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SM_CXICON,
+    SM_CXSMICON, TPM_LEFTALIGN, TPM_TOPALIGN, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_INITDIALOG,
+    WM_NOTIFY, WM_SETICON, WM_SIZE,
 };
 
 pub const IDD_MAIN: u32 = 100;
+pub const IDI_APP: u32 = 200;
 pub const IDC_LIST: u32 = 1000;
 pub const IDC_ENABLE: u32 = 1001;
 pub const IDC_DISABLE: u32 = 1002;
@@ -213,6 +217,57 @@ pub fn status_text(n: &Nic) -> String {
     }
 }
 
+/// 整行高亮、整行可点。这条是 ListView 的**扩展**样式：rc 模板里连常量都没有
+/// （`LVS_FULLROWSELECT` 在 rc 的预处理里未定义，实测 RC2104），只能在这里发消息。
+///
+/// # Safety
+/// `hl` 是主对话框的 ListView 控件。
+pub unsafe fn enable_full_row_select(hl: HWND) {
+    if hl.is_invalid() {
+        return;
+    }
+    let _ = SendMessageW(
+        hl,
+        LVM_SETEXTENDEDLISTVIEWSTYLE,
+        Some(WPARAM(0)),
+        Some(LPARAM(LVS_EX_FULLROWSELECT as isize)),
+    );
+}
+
+/// 标题栏图标。对话框模板没有图标字段（只有顶层窗口类的 `hIcon` 才有），
+/// 所以 .rc 里的 `IDI_APP ICON` 必须在运行时用 `WM_SETICON` 挂上去。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn set_title_icons(hwnd: HWND) {
+    let Ok(hmodule) = GetModuleHandleW(None) else {
+        return;
+    };
+    let hmodule: HINSTANCE = hmodule.into();
+    // LR_SHARED 拿的是系统缓存的图标，不能 DestroyIcon。
+    for (kind, size) in [
+        (ICON_SMALL, GetSystemMetrics(SM_CXSMICON)),
+        (ICON_BIG, GetSystemMetrics(SM_CXICON)),
+    ] {
+        let Ok(hicon) = LoadImageW(
+            Some(hmodule),
+            resource_id(IDI_APP),
+            IMAGE_ICON,
+            size,
+            size,
+            LR_SHARED,
+        ) else {
+            continue;
+        };
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(kind as usize)),
+            Some(LPARAM(hicon.0 as isize)),
+        );
+    }
+}
+
 /// # Safety
 /// `hwnd` 是主对话框。状态栏控件不存在时静默跳过。
 pub unsafe fn init_status_bar(hwnd: HWND) {
@@ -240,7 +295,12 @@ pub unsafe fn set_status(hwnd: HWND, text: &str) {
         return;
     }
     let w = wide(text);
-    let _ = SendMessageW(sb, SB_SETTEXTW, Some(WPARAM(0)), Some(LPARAM(w.as_ptr() as isize)));
+    let _ = SendMessageW(
+        sb,
+        SB_SETTEXTW,
+        Some(WPARAM(0)),
+        Some(LPARAM(w.as_ptr() as isize)),
+    );
 }
 
 /// # Safety
@@ -339,7 +399,11 @@ pub unsafe fn show_popup_menu(hwnd: HWND, hl: HWND) {
         (IDM_DISABLE, "禁用", has_sel && en_state),
     ];
     for (id, label, usable) in menus {
-        let flags = if usable { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let flags = if usable {
+            MF_STRING
+        } else {
+            MF_STRING | MF_GRAYED
+        };
         let text = wide(label);
         let _ = AppendMenuW(hmenu, flags, id as usize, PCWSTR(text.as_ptr()));
     }
@@ -381,7 +445,12 @@ pub fn confirm_disable_default_route(n: &Nic) -> bool {
             "「{}」是当前默认路由所在的网卡，禁用会立即断网。\n\n确定要禁用吗？",
             n.alias
         ));
-        let r = MessageBoxW(None, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONWARNING);
+        let r = MessageBoxW(
+            None,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONWARNING,
+        );
         disable_approved(r)
     }
 }
@@ -403,7 +472,12 @@ pub unsafe fn on_toggle(hwnd: HWND, hl: HWND, enable: bool) {
     if let Err(e) = netctl::set_enabled(n.if_index, &n.alias, enable) {
         let title = wide("错误");
         let body = wide(&format!("{verb}「{}」失败：{e}", n.alias));
-        let _ = MessageBoxW(Some(hwnd), PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+        let _ = MessageBoxW(
+            Some(hwnd),
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
         set_status(hwnd, &format!("{verb}「{}」失败", n.alias));
     } else {
         set_status(hwnd, &format!("已{verb}「{}」", n.alias));
@@ -527,6 +601,8 @@ pub unsafe extern "system" fn main_dlgproc(
 ) -> isize {
     match msg {
         WM_INITDIALOG => {
+            set_title_icons(hwnd);
+            enable_full_row_select(list_view(hwnd));
             set_columns(hwnd);
             ensure_groups(hwnd);
             init_status_bar(hwnd);
@@ -602,10 +678,19 @@ mod tests {
 
     #[test]
     fn status_text_three_states() {
-        assert_eq!(status_text(&nic(false, true, NicKind::Wired, "a")), "已禁用");
-        assert_eq!(status_text(&nic(false, false, NicKind::Wired, "a")), "已禁用");
+        assert_eq!(
+            status_text(&nic(false, true, NicKind::Wired, "a")),
+            "已禁用"
+        );
+        assert_eq!(
+            status_text(&nic(false, false, NicKind::Wired, "a")),
+            "已禁用"
+        );
         assert_eq!(status_text(&nic(true, true, NicKind::Wired, "a")), "已连接");
-        assert_eq!(status_text(&nic(true, false, NicKind::Wired, "a")), "已启用");
+        assert_eq!(
+            status_text(&nic(true, false, NicKind::Wired, "a")),
+            "已启用"
+        );
     }
 
     /// 禁用优先于连接：被禁用的卡即使 OperStatus 残留 Up 也必须显示「已禁用」
@@ -629,7 +714,12 @@ mod tests {
             ..nic(false, false, NicKind::Wired, "以太网")
         };
         assert!(!needs_disable_confirm(&routed_off));
-        assert!(!needs_disable_confirm(&nic(true, true, NicKind::Wireless, "WLAN")));
+        assert!(!needs_disable_confirm(&nic(
+            true,
+            true,
+            NicKind::Wireless,
+            "WLAN"
+        )));
     }
 
     /// 未触发确认门时不得弹窗，直接放行（这条同时锁住「取消语义」：true = 继续执行）。

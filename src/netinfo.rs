@@ -9,14 +9,16 @@ use windows::core::GUID;
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GetAdaptersAddresses, GetIfEntry2, GetIpForwardTable2, GetIpInterfaceEntry,
-    GAA_FLAG_INCLUDE_ALL_COMPARTMENTS, GAA_FLAG_INCLUDE_GATEWAYS, IP_ADAPTER_ADDRESSES_LH,
-    IP_ADAPTER_DNS_SERVER_ADDRESS_XP, IP_ADAPTER_GATEWAY_ADDRESS_LH,
+    GAA_FLAG_INCLUDE_ALL_COMPARTMENTS, GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_INCLUDE_GATEWAYS,
+    IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_DNS_SERVER_ADDRESS_XP, IP_ADAPTER_GATEWAY_ADDRESS_LH,
     IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
     MIB_IPINTERFACE_ROW,
 };
-use windows::Win32::NetworkManagement::Ndis::{IfOperStatusUp, NET_IF_ADMIN_STATUS_DOWN, NET_LUID_LH};
+use windows::Win32::NetworkManagement::Ndis::{
+    IfOperStatusUp, NET_IF_ADMIN_STATUS_DOWN, NET_LUID_LH,
+};
 use windows::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, AF_UNSPEC, SOCKET_ADDRESS, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKET_ADDRESS,
 };
 
 /// 一张物理网卡的全部可显示信息。字段与 Task 5 的列、Task 7 的详情行一一对应。
@@ -110,7 +112,11 @@ pub fn format_mac(buf: &[u8], len: u32) -> String {
 /// 不能再 `to_be()` —— 简报那行会把 /24 印成 `0.255.255.255`。
 fn prefix_to_mask(prefix: u8) -> String {
     let bits = prefix.min(32) as u32;
-    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    let mask = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
     Ipv4Addr::from(mask).to_string()
 }
 
@@ -134,11 +140,39 @@ fn format_guid(guid: &GUID) -> String {
     )
 }
 
-/// 列表过滤口径（Task 5 直接依赖）：关键字表命中、或结构化 IfType 命中、或没有物理地址。
-/// 三条并联而不是只靠 `is_virtual` 单打独斗 —— 中文 Windows 自带驱动的描述是中文，
+/// 列表过滤口径（Task 5 直接依赖）：关键字表命中、或结构化 IfType 命中、
+/// 或是 NDIS 筛选器绑定、或（未禁用且没有物理地址）。
+/// 多条并联而不是只靠 `is_virtual` 单打独斗 —— 中文 Windows 自带驱动的描述是中文，
 /// 13 个英文关键字必然漏判，见 `adapterclass::is_virtual_if_type`。
-fn is_filtered_out(if_type: u32, description: &str, physical_address_length: u32) -> bool {
-    is_virtual(description) || is_virtual_if_type(if_type) || physical_address_length == 0
+///
+/// `is_admin_disabled` 单独开一个口子：网卡被禁用后驱动往往不再上报物理地址
+/// （真机实测 Realtek USB GbE 禁用后 `PhysicalAddressLength` 归 0），
+/// 若仍按「无 MAC 即虚拟」处理，被禁用的卡就从列表里消失，用户再也无法把它启用回来。
+fn is_filtered_out(
+    if_type: u32,
+    description: &str,
+    physical_address_length: u32,
+    is_admin_disabled: bool,
+) -> bool {
+    is_virtual(description)
+        || is_virtual_if_type(if_type)
+        || is_filter_binding(description)
+        || (physical_address_length == 0 && !is_admin_disabled)
+}
+
+/// NDIS 筛选器绑定伪接口的命名约定：`<父接口描述>-<筛选器名>-<4 位十六进制实例号>`
+/// （真机实测 `…Adapter #2-QoS Packet Scheduler-0000`）。
+/// `GAA_FLAG_INCLUDE_ALL_INTERFACES` 会把这些绑定一起带进来，而它们的 IfType、MAC
+/// 与父接口完全一样，关键字表和 IfType 都拦不住 —— 一张 WLAN 会拖出 4 行重复项。
+fn is_filter_binding(description: &str) -> bool {
+    match description.rsplit_once('-') {
+        Some((head, instance)) => {
+            instance.len() == 4
+                && instance.bytes().all(|b| b.is_ascii_hexdigit())
+                && !head.is_empty()
+        }
+        None => false,
+    }
 }
 
 /// 排序：先按分组（有线 → 无线 → 其他），组内按名称忽略大小写。
@@ -167,10 +201,15 @@ pub fn list() -> Result<Vec<Nic>, String> {
         // 真 ANSI 的只有 AdapterName（Task 6 的 netsh 才用）。
         let description = unsafe { wstr_from_ptr(a.Description.0) };
         let alias = unsafe { wstr_from_ptr(a.FriendlyName.0) };
-        if is_filtered_out(a.IfType, &description, a.PhysicalAddressLength) {
+        // 每行问一次管理状态：过滤判据要用它（禁用的卡可能不再上报 MAC），
+        // 取到的结果顺手交给 build_nic，避免同一行问两次。
+        // IfIndex 与 Length 共用 union，取它需要 unsafe；本循环里只取这一次。
+        let if_index = unsafe { a.Anonymous1.Anonymous.IfIndex };
+        let disabled = admin_disabled(if_index);
+        if is_filtered_out(a.IfType, &description, a.PhysicalAddressLength, disabled) {
             continue;
         }
-        out.push(unsafe { build_nic(a, &description, &alias, &defaults) });
+        out.push(unsafe { build_nic(a, &description, &alias, &defaults, disabled) });
     }
     sort_nics(&mut out);
     Ok(out)
@@ -185,6 +224,7 @@ unsafe fn build_nic(
     description: &str,
     alias: &str,
     defaults: &[u32],
+    disabled: bool,
 ) -> Nic {
     // IfIndex 藏在 Anonymous1.Anonymous 里（与 Length 共用 union）
     let if_index = a.Anonymous1.Anonymous.IfIndex;
@@ -200,7 +240,7 @@ unsafe fn build_nic(
         gateway: String::new(),
         dns: Vec::new(),
         speed: format_speed(a.TransmitLinkSpeed),
-        enabled: !admin_disabled(if_index),
+        enabled: !disabled,
         connected: a.OperStatus == IfOperStatusUp,
         is_default_route: defaults.contains(&if_index),
         metric: interface_metric(if_index, a.Luid),
@@ -218,7 +258,11 @@ fn fetch_adapter_table() -> Result<(Vec<u8>, u32), String> {
     let mut size: u32 = INITIAL_ADAPTER_BUFFER;
     let mut buf = vec![0u8; size as usize];
     let mut retries = 0u32;
-    let flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_ALL_COMPARTMENTS;
+    // INCLUDE_ALL_INTERFACES 是「禁用后仍能在列表里看到并重新启用」的前提：
+    // 不带它，被禁用的接口整条不出现在返回链表中（真机实测：蓝牙网络连接禁用后消失）。
+    let flags = GAA_FLAG_INCLUDE_GATEWAYS
+        | GAA_FLAG_INCLUDE_ALL_COMPARTMENTS
+        | GAA_FLAG_INCLUDE_ALL_INTERFACES;
     loop {
         let status = unsafe {
             GetAdaptersAddresses(
@@ -538,7 +582,10 @@ mod tests {
         assert_eq!(retry_buffer_size(22944), INITIAL_ADAPTER_BUFFER);
         // 异常出参（0）也不能退化成 1 字节缓冲
         assert_eq!(retry_buffer_size(0), INITIAL_ADAPTER_BUFFER);
-        assert_eq!(retry_buffer_size(INITIAL_ADAPTER_BUFFER), INITIAL_ADAPTER_BUFFER);
+        assert_eq!(
+            retry_buffer_size(INITIAL_ADAPTER_BUFFER),
+            INITIAL_ADAPTER_BUFFER
+        );
         // 真正的大需求必须照用，否则会反复溢出
         assert_eq!(retry_buffer_size(1 << 20), 1 << 20);
     }
@@ -570,7 +617,11 @@ mod tests {
     /// 只有前 PhysicalAddressLength 个有效」这条约定。
     #[test]
     fn mac_length_is_respected() {
-        assert_eq!(format_mac(&[0x01], 4), "", "声明长度超过缓冲区时必须返回空串");
+        assert_eq!(
+            format_mac(&[0x01], 4),
+            "",
+            "声明长度超过缓冲区时必须返回空串"
+        );
         assert_eq!(format_mac(&[0xAA; 8], 8), "aa-aa-aa-aa-aa-aa-aa-aa");
         assert_eq!(
             format_mac(&[0xAB, 0x0C, 0xF0, 0x01, 0x02, 0x03, 0xFF, 0xFF], 6),
@@ -578,7 +629,10 @@ mod tests {
             "尾部填充字节不得进入 MAC"
         );
         // 单字节补零、字母小写
-        assert_eq!(format_mac(&[0x0A, 0xFF, 0x00, 0x1B, 0x2C, 0x3D], 6), "0a-ff-00-1b-2c-3d");
+        assert_eq!(
+            format_mac(&[0x0A, 0xFF, 0x00, 0x1B, 0x2C, 0x3D], 6),
+            "0a-ff-00-1b-2c-3d"
+        );
     }
 
     // ---------------- prefix_to_mask ----------------
@@ -618,7 +672,12 @@ mod tests {
 
     #[test]
     fn guid_registry_format() {
-        let g = GUID::from_values(0x1234_5678, 0xABCD, 0xEF01, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        let g = GUID::from_values(
+            0x1234_5678,
+            0xABCD,
+            0xEF01,
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        );
         assert_eq!(format_guid(&g), "{12345678-ABCD-EF01-0102-030405060708}");
         // 零 GUID 也照实输出，不做「空即隐藏」的处理
         assert_eq!(
@@ -629,25 +688,115 @@ mod tests {
 
     // ---------------- 过滤判据 ----------------
 
-    /// 控制器裁定：过滤 = is_virtual(描述) || is_virtual_if_type(IfType) || 无物理地址。
+    /// 控制器裁定：过滤 = is_virtual(描述) || is_virtual_if_type(IfType) || (无物理地址且未禁用)。
+    /// 下面全部按「启用中」（第 4 参 false）取样，禁用带来的 MAC 缺失例外单独测。
     #[test]
     fn filter_rule_table() {
         // 物理网卡必须留下
-        assert!(!is_filtered_out(6, "Realtek PCIe GbE Family Controller", 6));
-        assert!(!is_filtered_out(71, "Intel(R) Wi-Fi 6E AX211 160MHz", 6));
-        assert!(!is_filtered_out(6, "以太网 网络适配器", 6), "本地化中文描述不得被误杀");
+        assert!(!is_filtered_out(
+            6,
+            "Realtek PCIe GbE Family Controller",
+            6,
+            false
+        ));
+        assert!(!is_filtered_out(
+            71,
+            "Intel(R) Wi-Fi 6E AX211 160MHz",
+            6,
+            false
+        ));
+        assert!(
+            !is_filtered_out(6, "以太网 网络适配器", 6, false),
+            "本地化中文描述不得被误杀"
+        );
         // 关键字命中（英文虚拟描述）
-        assert!(is_filtered_out(6, "Hyper-V Virtual Ethernet Adapter", 6));
-        assert!(is_filtered_out(6, "TAP-Windows Adapter V9", 6));
+        assert!(is_filtered_out(
+            6,
+            "Hyper-V Virtual Ethernet Adapter",
+            6,
+            false
+        ));
+        assert!(is_filtered_out(6, "TAP-Windows Adapter V9", 6, false));
         // 结构化 IfType 命中：中文 Windows 上自带驱动的描述是中文，只能靠 IfType 兜住
-        assert!(is_filtered_out(23, "WAN 微型端口 (IP)", 0), "PPP=23 必须算虚拟");
-        assert!(is_filtered_out(131, "Microsoft IP-HTTPS 平台适配器", 0), "TUNNEL=131 必须算虚拟");
-        assert!(is_filtered_out(53, "某国产 VPN 适配器", 6), "PROP_VIRTUAL=53 必须算虚拟");
-        assert!(is_filtered_out(24, "Software Loopback Interface 1", 0), "环回=24 必须算虚拟");
-        // 没有物理地址的一律滤掉
-        assert!(is_filtered_out(6, "Some Physical Adapter", 0), "PhysicalAddressLength=0 必须滤掉");
+        assert!(
+            is_filtered_out(23, "WAN 微型端口 (IP)", 0, false),
+            "PPP=23 必须算虚拟"
+        );
+        assert!(
+            is_filtered_out(131, "Microsoft IP-HTTPS 平台适配器", 0, false),
+            "TUNNEL=131 必须算虚拟"
+        );
+        assert!(
+            is_filtered_out(53, "某国产 VPN 适配器", 6, false),
+            "PROP_VIRTUAL=53 必须算虚拟"
+        );
+        assert!(
+            is_filtered_out(24, "Software Loopback Interface 1", 0, false),
+            "环回=24 必须算虚拟"
+        );
+        // 启用中却没有物理地址 → 按虚拟滤掉
+        assert!(
+            is_filtered_out(6, "Some Physical Adapter", 0, false),
+            "PhysicalAddressLength=0 且未禁用必须滤掉"
+        );
         // 已知残留风险（如实留档）：纯中文虚拟名 + 物理 IfType + 有 MAC 时仍会留下
-        assert!(!is_filtered_out(6, "虚拟以太网适配器", 6));
+        assert!(!is_filtered_out(6, "虚拟以太网适配器", 6, false));
+    }
+
+    /// 禁用中的物理网卡常常不再上报 MAC（真机实测：Realtek USB GbE 禁用后 maclen 归 0）。
+    /// 只按 MAC 判虚拟就会把「正等着被重新启用」的那张卡整条藏掉。
+    #[test]
+    fn admin_disabled_adapter_survives_missing_mac() {
+        assert!(!is_filtered_out(
+            6,
+            "Realtek USB GbE Family Controller",
+            0,
+            true
+        ));
+        // 启用状态下的无 MAC 仍按虚拟处理
+        assert!(is_filtered_out(
+            6,
+            "Realtek USB GbE Family Controller",
+            0,
+            false
+        ));
+        // 关键字/结构化 IfType 命中时，禁用也救不回来
+        assert!(is_filtered_out(
+            6,
+            "Hyper-V Virtual Ethernet Adapter",
+            0,
+            true
+        ));
+        assert!(is_filtered_out(131, "某国产 VPN 适配器", 0, true));
+    }
+
+    /// 筛选器绑定必须整类拦掉：一张 WLAN 会拖出 4 行同名重复项。
+    #[test]
+    fn filter_bindings_are_hidden() {
+        let binding = "Qualcomm FastConnect 7800 Network Adapter #2-QoS Packet Scheduler-0000";
+        assert!(is_filtered_out(71, binding, 6, false));
+        // 父接口自己也被禁用时，绑定同样不能漏
+        assert!(is_filter_binding(
+            "Realtek USB GbE Family Controller-WFP Native MAC Layer LightWeight Filter-0000"
+        ));
+        assert!(is_filter_binding(
+            "WAN Miniport (IP)-QoS Packet Scheduler-0000"
+        ));
+    }
+
+    /// 真实适配器描述里也有连字符，命名约定不能把它们误杀。
+    #[test]
+    fn real_adapter_names_are_not_filter_bindings() {
+        for name in [
+            "Realtek PCIe GbE Family Controller",
+            "TAP-Windows Adapter V9",
+            "Intel(R) Wi-Fi 6E AX211 160MHz",
+            "Bluetooth Device (Personal Area Network)",
+            "ASIX USB to Gigabit Ethernet Family Adapter",
+            "Marvell AVASTAR Wireless-USB Network Adapter",
+        ] {
+            assert!(!is_filter_binding(name), "{name} 被误判成筛选器绑定");
+        }
     }
 
     // ---------------- 排序 ----------------
@@ -685,13 +834,19 @@ mod tests {
             v.iter().map(|n| n.alias.as_str()).collect::<Vec<_>>(),
             vec!["zeta-wired", "mid-wireless", "alpha-other"]
         );
-        assert_eq!(v.iter().map(|n| n.if_index).collect::<Vec<_>>(), vec![2, 3, 1]);
+        assert_eq!(
+            v.iter().map(|n| n.if_index).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
     }
 
     /// 组内比较必须忽略大小写：B/a 这对值在「按原始字节比较」时结果相反。
     #[test]
     fn sort_is_case_insensitive_within_group() {
-        let mut v = vec![test_nic(1, "B", NicKind::Wired), test_nic(2, "a", NicKind::Wired)];
+        let mut v = vec![
+            test_nic(1, "B", NicKind::Wired),
+            test_nic(2, "a", NicKind::Wired),
+        ];
         sort_nics(&mut v);
         assert_eq!(
             v.iter().map(|n| n.alias.as_str()).collect::<Vec<_>>(),
@@ -713,7 +868,10 @@ mod tests {
             vec![11, 12, 13]
         );
         // 只有大小写差异时也算「相等」，同样保持原次序
-        let mut mixed = vec![test_nic(21, "Eth", NicKind::Wired), test_nic(22, "eth", NicKind::Wired)];
+        let mut mixed = vec![
+            test_nic(21, "Eth", NicKind::Wired),
+            test_nic(22, "eth", NicKind::Wired),
+        ];
         sort_nics(&mut mixed);
         assert_eq!(
             mixed.iter().map(|n| n.if_index).collect::<Vec<_>>(),
@@ -730,7 +888,10 @@ mod tests {
         assert_eq!(c.alias, "以太网");
         assert_eq!(c.kind, NicKind::Wireless);
         let text = format!("{n:?}");
-        assert!(text.contains("alias") && text.contains("network_guid"), "{text}");
+        assert!(
+            text.contains("alias") && text.contains("network_guid"),
+            "{text}"
+        );
     }
 
     // ---------------- sockaddr 解码 ----------------
@@ -740,7 +901,11 @@ mod tests {
         SOCKADDR_IN {
             sin_family: AF_INET,
             sin_port: 0,
-            sin_addr: IN_ADDR { S_un: IN_ADDR_0 { S_addr: u32::from_ne_bytes(ip) } },
+            sin_addr: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from_ne_bytes(ip),
+                },
+            },
             sin_zero: [0; 8],
         }
     }
@@ -750,7 +915,9 @@ mod tests {
             sin6_family: AF_INET6,
             sin6_port: 0,
             sin6_flowinfo: 0,
-            sin6_addr: IN6_ADDR { u: IN6_ADDR_0 { Byte: octets } },
+            sin6_addr: IN6_ADDR {
+                u: IN6_ADDR_0 { Byte: octets },
+            },
             Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: 0 },
         }
     }
@@ -758,7 +925,10 @@ mod tests {
     /// 把**已在原地**的 sockaddr 包成 SOCKET_ADDRESS。
     /// 调用方必须保证 `sa` 在使用返回值的整段时间里不被移动/借用，否则指针悬垂。
     fn sock_of<T>(sa: &mut T, len: i32) -> SOCKET_ADDRESS {
-        SOCKET_ADDRESS { lpSockaddr: sa as *mut T as *mut SOCKADDR, iSockaddrLength: len }
+        SOCKET_ADDRESS {
+            lpSockaddr: sa as *mut T as *mut SOCKADDR,
+            iSockaddrLength: len,
+        }
     }
 
     #[test]
@@ -776,10 +946,16 @@ mod tests {
 
     #[test]
     fn sockaddr_v6_decodes_octets() {
-        let mut sa = v6_addr([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+        let mut sa = v6_addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]);
         let addr = sock_of(&mut sa, std::mem::size_of::<SOCKADDR_IN6>() as i32);
         assert_eq!(unsafe { socket_address_to_string(&addr) }, "2001:db8::1");
-        assert_eq!(unsafe { socket_address_to_ipv4(&addr) }, None, "IPv6 不得被当成 IPv4");
+        assert_eq!(
+            unsafe { socket_address_to_ipv4(&addr) },
+            None,
+            "IPv6 不得被当成 IPv4"
+        );
     }
 
     /// 内存安全：声明长度小于目标结构体时必须拒绝解引用，而不是越界读。
@@ -793,7 +969,11 @@ mod tests {
         addr.iSockaddrLength = 0;
         assert_eq!(unsafe { socket_address_to_ipv4(&addr) }, None);
         addr.iSockaddrLength = -1;
-        assert_eq!(unsafe { socket_address_to_string(&addr) }, "", "负长度不得变成超大 usize");
+        assert_eq!(
+            unsafe { socket_address_to_string(&addr) },
+            "",
+            "负长度不得变成超大 usize"
+        );
 
         // IPv6 同理：长度够 SOCKADDR_IN 但不够 SOCKADDR_IN6 时不得按 v6 读
         let mut sa6 = v6_addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
@@ -806,11 +986,17 @@ mod tests {
 
     #[test]
     fn sockaddr_null_and_unknown_family_are_empty() {
-        let null_addr = SOCKET_ADDRESS { lpSockaddr: std::ptr::null_mut(), iSockaddrLength: 16 };
+        let null_addr = SOCKET_ADDRESS {
+            lpSockaddr: std::ptr::null_mut(),
+            iSockaddrLength: 16,
+        };
         assert_eq!(unsafe { socket_address_to_ipv4(&null_addr) }, None);
         assert_eq!(unsafe { socket_address_to_string(&null_addr) }, "");
 
-        let mut sa = SOCKADDR { sa_family: AF_UNSPEC, sa_data: [0; 14] };
+        let mut sa = SOCKADDR {
+            sa_family: AF_UNSPEC,
+            sa_data: [0; 14],
+        };
         let unspec = sock_of(&mut sa, std::mem::size_of::<SOCKADDR>() as i32);
         assert_eq!(unsafe { socket_address_to_ipv4(&unspec) }, None);
         assert_eq!(unsafe { socket_address_to_string(&unspec) }, "");
@@ -837,7 +1023,9 @@ mod tests {
         };
 
         // 网关：第一行是 IPv6（必须跳过），第二行才是 IPv4
-        let mut sa_gw_v6 = v6_addr([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+        let mut sa_gw_v6 = v6_addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ]);
         let mut sa_gw_v4 = v4_addr([10, 0, 0, 1]);
         let mut g2 = IP_ADAPTER_GATEWAY_ADDRESS_LH {
             Address: sock_of(&mut sa_gw_v4, std::mem::size_of::<SOCKADDR_IN>() as i32),
@@ -852,9 +1040,13 @@ mod tests {
         // DNS：重复项 + 一个不认识的地址族都要被处理掉
         let mut sa_dns1 = v4_addr([223, 5, 5, 5]);
         let mut sa_dns2 = v4_addr([223, 5, 5, 5]);
-        let mut sa_dns3 =
-            v6_addr([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01]);
-        let mut sa_dns4 = SOCKADDR { sa_family: AF_UNSPEC, sa_data: [0; 14] };
+        let mut sa_dns3 = v6_addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01,
+        ]);
+        let mut sa_dns4 = SOCKADDR {
+            sa_family: AF_UNSPEC,
+            sa_data: [0; 14],
+        };
         let mut d4 = IP_ADAPTER_DNS_SERVER_ADDRESS_XP {
             Address: sock_of(&mut sa_dns4, std::mem::size_of::<SOCKADDR>() as i32),
             ..Default::default()
@@ -885,10 +1077,19 @@ mod tests {
         let mut nic = test_nic(1, "以太网", NicKind::Wired);
         unsafe { fill_addresses(&a, &mut nic) };
 
-        assert_eq!(nic.ipv4, "10.0.0.5", "必须取第一个 IPv4，而不是链表尾部的 APIPA 地址");
-        assert_eq!(nic.mask, "255.255.255.0", "掩码必须取同一行的 /24，不是第二行的 /16");
+        assert_eq!(
+            nic.ipv4, "10.0.0.5",
+            "必须取第一个 IPv4，而不是链表尾部的 APIPA 地址"
+        );
+        assert_eq!(
+            nic.mask, "255.255.255.0",
+            "掩码必须取同一行的 /24，不是第二行的 /16"
+        );
         assert_eq!(nic.gateway, "10.0.0.1", "网关要跳过 IPv6 行取第一个 IPv4");
-        assert_eq!(nic.dns, vec!["223.5.5.5".to_string(), "2001:db8::1".to_string()]);
+        assert_eq!(
+            nic.dns,
+            vec!["223.5.5.5".to_string(), "2001:db8::1".to_string()]
+        );
         // 链表走完（d4 之后 Next 为空）必须停止，不得崩溃或重复
         assert_eq!(nic.dns.len(), 2);
     }
@@ -937,7 +1138,10 @@ mod tests {
             );
         }
         let (buf, retries) = fetch_adapter_table().expect("fetch_adapter_table 失败");
-        println!("fetch_adapter_table 缓冲重试次数 = {retries}，缓冲区 {} 字节", buf.len());
+        println!(
+            "fetch_adapter_table 缓冲重试次数 = {retries}，缓冲区 {} 字节",
+            buf.len()
+        );
 
         // ---- 2) 每张网卡（含被过滤掉的）的完整清单 ----
         println!("\n=== 原始网卡清单（未过滤）===");
@@ -969,8 +1173,10 @@ mod tests {
                 } else {
                     String::from_utf8_lossy(a.AdapterName.as_bytes()).into_owned()
                 };
-                let skip = is_filtered_out(a.IfType, &description, a.PhysicalAddressLength);
-                let nic = build_nic(a, &description, &alias, &defaults);
+                let disabled = admin_disabled(a.Anonymous1.Anonymous.IfIndex);
+                let skip =
+                    is_filtered_out(a.IfType, &description, a.PhysicalAddressLength, disabled);
+                let nic = build_nic(a, &description, &alias, &defaults, disabled);
                 rows.push(RowDump {
                     if_index: a.Anonymous1.Anonymous.IfIndex,
                     luid: a.Luid,
@@ -1002,10 +1208,20 @@ mod tests {
             println!("     alias={} adapter_name={}", r.alias, r.adapter_name);
             println!(
                 "     mac={} speed={} en={} conn={} metric={} gw={} ip={}/{} dns={:?}",
-                r.nic.mac, r.nic.speed, r.nic.enabled, r.nic.connected, r.nic.metric, r.nic.gateway,
-                r.nic.ipv4, r.nic.mask, r.nic.dns
+                r.nic.mac,
+                r.nic.speed,
+                r.nic.enabled,
+                r.nic.connected,
+                r.nic.metric,
+                r.nic.gateway,
+                r.nic.ipv4,
+                r.nic.mask,
+                r.nic.dns
             );
-            println!("     guid={} defrt={}", r.nic.network_guid, r.nic.is_default_route);
+            println!(
+                "     guid={} defrt={}",
+                r.nic.network_guid, r.nic.is_default_route
+            );
         }
         println!("共 {} 条原始条目，保留 {kept} 条", rows.len());
 
@@ -1031,7 +1247,10 @@ mod tests {
                 n.network_guid
             );
         }
-        assert!(!nics.is_empty(), "未采集到任何物理网卡，检查权限或 API 调用");
+        assert!(
+            !nics.is_empty(),
+            "未采集到任何物理网卡，检查权限或 API 调用"
+        );
 
         // ---- 4) 禁用状态 + 两个 Entry API 的真实返回形态 ----
         // 对照命令（只读，不改任何网卡状态）：netsh interface show interface
