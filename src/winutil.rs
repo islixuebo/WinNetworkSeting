@@ -47,7 +47,8 @@ pub unsafe fn wstr_from_pstr(p: PSTR) -> String {
 }
 
 /// Win32 错误码 → 系统消息文本（语言交给系统默认 UI 语言，中文系统即中文）；
-/// FormatMessageW 取不到消息时回退「错误码 N」。
+/// FormatMessageW 取不到消息时回退「错误码 N」；取到消息但 trim 掉 `\\r\\n.` 后为空串，
+/// 同样走这条回退分支（不让调用方拿到看不见的空文案）。
 pub fn error_text(code: u32) -> String {
     let mut buf = [0u16; 512];
     // windows 0.61.3 的签名：FormatMessageW(flags, Option<*const c_void>, id, langid,
@@ -107,7 +108,9 @@ mod tests {
 
     #[test]
     fn wstr_from_pstr_decodes_utf16_bytes() {
-        // IP Helper 的字段类型是 PSTR，但里面装的是 UTF-16；这里用真实的宽缓冲区验证 reinterpret 语义
+        // 本函数只用于「类型标成 PSTR、内容已知是 UTF-16」的场景；
+        // 0.61.3 的 IP Helper 宽字段（DnsSuffix/Description/FriendlyName）直接
+        // wstr_from_ptr(x.0)，不要绕这里。测试用真实的宽缓冲区验证 reinterpret 语义。
         let text = "以太网";
         let data = wide(text);
         let p = PSTR(data.as_ptr().cast::<u8>().cast_mut());

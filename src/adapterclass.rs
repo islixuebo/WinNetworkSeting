@@ -11,14 +11,24 @@ pub enum NicKind {
 }
 
 // IF_TYPE 数字取自 IANA ifTypes（iprtdb.h / ipifcons.h），与 netinfo 里的 if_type 同源。
-const IF_TYPE_ETHERNET: u32 = 6;
-const IF_TYPE_IEEE80211: u32 = 71;
-const IF_TYPE_WWANPP: u32 = 243;
-const IF_TYPE_WWANPP2: u32 = 244;
+// 公开给 netinfo：`is_virtual_if_type` 的判据与真机诊断清单都引用同一批常量，避免两处各写一份数字。
+pub const IF_TYPE_ETHERNET: u32 = 6;
+pub const IF_TYPE_IEEE80211: u32 = 71;
+pub const IF_TYPE_WWANPP: u32 = 243;
+pub const IF_TYPE_WWANPP2: u32 = 244;
+// 以下四个不是「网卡类型」而是「这类接口必然不是用户要管理的物理卡」的信号。
+pub const IF_TYPE_PPP: u32 = 23;
+pub const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+pub const IF_TYPE_PROP_VIRTUAL: u32 = 53;
+pub const IF_TYPE_TUNNEL: u32 = 131;
 
 /// 按 IF_TYPE 分类；IF_TYPE 不认识时回退到驱动描述关键字。
 /// `description` 传 IP_ADAPTER_ADDRESSES_LH.Description（驱动描述，通常是英文），
 /// 不要传本地化的 FriendlyName，否则关键字表失效。
+///
+/// 跨任务契约：虚拟网卡（Hyper-V、VPN、隧道）常带**物理** IfType（例如 Hyper-V
+/// 虚拟以太网适配器就是 6），所以 `NicKind` 不可用来推断「这是物理卡」——
+/// 过滤只能靠 `is_virtual` + `is_virtual_if_type` + 物理地址长度。
 pub fn classify(if_type: u32, description: &str) -> NicKind {
     match if_type {
         IF_TYPE_ETHERNET => NicKind::Wired,
@@ -84,6 +94,21 @@ pub fn is_virtual(description: &str) -> bool {
     ]
     .iter()
     .any(|k| d.contains(k))
+}
+
+/// 结构化虚拟信号：IfType 本身就是「不是物理卡」的类型编号。
+///
+/// 存在的理由：`is_virtual` 的关键字表是英文的，而中文 Windows 自带驱动的描述本身就是
+/// 中文（「WAN 微型端口 (IP)」= PPP 23、「Microsoft IP-HTTPS 平台适配器」= 隧道 131），
+/// 只靠关键字表必然漏判。netinfo 的过滤条件把它和 `is_virtual` 并联使用。
+///
+/// 四个编号取自 ipifcons.h：23=PPP、24=SOFTWARE_LOOPBACK、53=PROP_VIRTUAL（专有虚拟/内部）、
+/// 131=TUNNEL（封装/隧道接口）。
+pub fn is_virtual_if_type(if_type: u32) -> bool {
+    matches!(
+        if_type,
+        IF_TYPE_PPP | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_PROP_VIRTUAL | IF_TYPE_TUNNEL
+    )
 }
 
 #[cfg(test)]
@@ -265,9 +290,11 @@ mod tests {
         }
     }
 
-    /// 中文描述的行为留档：关键字表是英文的，本地化中文名不参与判定。
+    /// 已知盲区的机制留档（不是对正确性的背书）：关键字表是英文的，纯中文描述一律不命中，
+    /// 所以 `is_virtual("虚拟专用网络适配器")` 为 false。真实过滤由 netinfo 并联
+    /// `is_virtual_if_type` + 物理地址长度兜底，见 `is_filtered_out`。
     #[test]
-    fn chinese_descriptions_follow_documented_behavior() {
+    fn chinese_descriptions_are_a_known_blind_spot() {
         // IF_TYPE 命中时中文描述无影响
         assert_eq!(classify(6, "以太网 网络适配器"), NicKind::Wired);
         assert_eq!(classify(71, "无线局域网适配器"), NicKind::Wireless);
@@ -277,6 +304,47 @@ mod tests {
         assert!(!is_virtual("虚拟专用网络适配器"));
         // 中英混排时只要含 ASCII 关键字就仍算虚拟
         assert!(is_virtual("Hyper-V 虚拟以太网适配器"));
+    }
+
+    /// Task 4 的结构化虚拟信号：IfType 属于 {23 PPP, 24 环回, 53 虚拟/内部, 131 隧道} 即虚拟。
+    /// 中文 Windows 自带驱动的描述是中文（如「WAN 微型端口 (IP)」），英文关键字表必然漏判，
+    /// netinfo::list() 靠这个函数兜住这些卡。
+    #[test]
+    fn is_virtual_if_type_table() {
+        let virtual_types: [u32; 4] = [23, 24, 53, 131];
+        for t in virtual_types {
+            assert!(is_virtual_if_type(t), "IfType={t} 应判为虚拟/环回/隧道");
+        }
+        // 物理与常见真实类型必须为 false，否则 Task 4 会把真网卡滤掉
+        let physical_types: [u32; 11] = [0, 1, 6, 7, 9, 15, 28, 71, 125, 243, 244];
+        for t in physical_types {
+            assert!(!is_virtual_if_type(t), "IfType={t} 不应被判为虚拟");
+        }
+        // 边界：邻位数字不得被范围判断误吞
+        assert!(!is_virtual_if_type(22));
+        assert!(!is_virtual_if_type(25));
+        assert!(!is_virtual_if_type(52));
+        assert!(!is_virtual_if_type(54));
+        assert!(!is_virtual_if_type(130));
+        assert!(!is_virtual_if_type(132));
+        assert!(!is_virtual_if_type(u32::MAX));
+    }
+
+    /// 结构化常量对外可见：netinfo 的过滤判据与真机清单都要引用同一批数字。
+    #[test]
+    fn if_type_constants_are_public() {
+        assert_eq!(IF_TYPE_ETHERNET, 6);
+        assert_eq!(IF_TYPE_IEEE80211, 71);
+        assert_eq!(IF_TYPE_WWANPP, 243);
+        assert_eq!(IF_TYPE_WWANPP2, 244);
+        assert_eq!(IF_TYPE_PPP, 23);
+        assert_eq!(IF_TYPE_SOFTWARE_LOOPBACK, 24);
+        assert_eq!(IF_TYPE_PROP_VIRTUAL, 53);
+        assert_eq!(IF_TYPE_TUNNEL, 131);
+        // classify 走 IF_TYPE 分支时，中文虚拟描述会被判成物理类型 —— 这正是
+        // netinfo 必须另用 is_virtual_if_type 过滤的原因（NicKind 不可用来推断物理卡）。
+        assert_eq!(classify(6, "虚拟以太网适配器"), NicKind::Wired);
+        assert!(is_virtual_if_type(24));
     }
 
     /// NicKind 的派生契约（简报 Interfaces 指定 Debug/PartialEq/Eq/Clone/Copy）：

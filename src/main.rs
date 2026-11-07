@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 pub mod adapterclass;
+pub mod netinfo;
 pub mod winutil;
 
 use windows::core::PCWSTR;
