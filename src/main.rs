@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+pub mod adapterclass;
 pub mod winutil;
 
 use windows::core::PCWSTR;
