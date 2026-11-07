@@ -90,9 +90,8 @@ fn last_line(bytes: &[u8]) -> Option<String> {
 pub fn set_enabled(if_index: u32, alias: &str, enable: bool) -> Result<(), String> {
     match run_netsh(&netsh_args_for(alias, enable)) {
         Ok(()) => Ok(()),
-        Err(primary) => run_netadapter(&netadapter_args_for(if_index, enable)).map_err(|fallback| {
-            format!("{primary}；按 ifIndex 回退也失败：{fallback}")
-        }),
+        Err(primary) => run_netadapter(&netadapter_args_for(if_index, enable))
+            .map_err(|fallback| format!("{primary}；按 ifIndex 回退也失败：{fallback}")),
     }
 }
 
@@ -122,9 +121,17 @@ mod tests {
     #[test]
     fn netadapter_args_address_by_index() {
         let a = netadapter_args_for(15, false);
-        assert!(a[3].ends_with("Disable-NetAdapter -InterfaceIndex 15 -Confirm:$False"), "{}", a[3]);
+        assert!(
+            a[3].ends_with("Disable-NetAdapter -InterfaceIndex 15 -Confirm:$False"),
+            "{}",
+            a[3]
+        );
         let b = netadapter_args_for(13, true);
-        assert!(b[3].ends_with("Enable-NetAdapter -InterfaceIndex 13 -Confirm:$False"), "{}", b[3]);
+        assert!(
+            b[3].ends_with("Enable-NetAdapter -InterfaceIndex 13 -Confirm:$False"),
+            "{}",
+            b[3]
+        );
     }
 
     /// -NonInteractive 是硬要求：UI 线程同步等待子进程，任何提示都会把窗口冻住。
@@ -182,7 +189,10 @@ mod tests {
             failure_text("netsh", Some(1), b"real\n\n   \n", b""),
             "netsh 退出码 1：real"
         );
-        assert_eq!(failure_text("netsh", Some(1), b"\n \n", b""), "netsh 退出码 1");
+        assert_eq!(
+            failure_text("netsh", Some(1), b"\n \n", b""),
+            "netsh 退出码 1"
+        );
     }
 
     #[test]

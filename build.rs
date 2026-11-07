@@ -20,7 +20,9 @@ fn main() {
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => panic!("rc.exe 编译资源失败，退出码 {:?}", s.code()),
-        Err(e) => panic!("找不到 rc.exe（需要 MSVC Build Tools，或用 build.ps1 导入 vcvars 环境）：{e}"),
+        Err(e) => {
+            panic!("找不到 rc.exe（需要 MSVC Build Tools，或用 build.ps1 导入 vcvars 环境）：{e}")
+        }
     }
 
     // 只有发布构建才把资源链接进 exe（门控理由见下）。

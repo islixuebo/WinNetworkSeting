@@ -46,9 +46,15 @@ fn keyword_fallback(description: &str) -> NicKind {
         .any(|k| d.contains(k))
     {
         NicKind::Wireless
-    } else if ["ethernet", "gbe", "gb e", "pcie gigabit", "family controller"]
-        .iter()
-        .any(|k| d.contains(k))
+    } else if [
+        "ethernet",
+        "gbe",
+        "gb e",
+        "pcie gigabit",
+        "family controller",
+    ]
+    .iter()
+    .any(|k| d.contains(k))
     {
         NicKind::Wired
     } else {
@@ -117,7 +123,10 @@ mod tests {
 
     #[test]
     fn ethernet_if_type_is_wired() {
-        assert_eq!(classify(6, "Intel(R) Ethernet Connection I219-V"), NicKind::Wired);
+        assert_eq!(
+            classify(6, "Intel(R) Ethernet Connection I219-V"),
+            NicKind::Wired
+        );
     }
 
     #[test]
@@ -133,14 +142,25 @@ mod tests {
 
     #[test]
     fn unknown_if_type_falls_back_to_description_keyword() {
-        assert_eq!(classify(0, "Marvell AVASTAR Wireless-AC"), NicKind::Wireless);
+        assert_eq!(
+            classify(0, "Marvell AVASTAR Wireless-AC"),
+            NicKind::Wireless
+        );
         assert_eq!(classify(0, "Realtek PCIe GbE Family"), NicKind::Wired);
-        assert_eq!(classify(0, "Microsoft Kernel Debug Network"), NicKind::Other);
+        assert_eq!(
+            classify(0, "Microsoft Kernel Debug Network"),
+            NicKind::Other
+        );
     }
 
     #[test]
     fn wifi_keyword_variants_all_wireless() {
-        for d in ["ASUS Wi-Fi", "USB WiFi Adapter", "Qualcomm WLAN", "802.11n USB LAN"] {
+        for d in [
+            "ASUS Wi-Fi",
+            "USB WiFi Adapter",
+            "Qualcomm WLAN",
+            "802.11n USB LAN",
+        ] {
             assert_eq!(classify(0, d), NicKind::Wireless, "描述：{d}");
         }
     }
@@ -171,26 +191,71 @@ mod tests {
         let cases: [(&str, u32, &str, NicKind); 22] = [
             // IF_TYPE 精确分支：命中时描述完全不起作用
             ("if_type=6 有线", 6, "Something Unknown", NicKind::Wired),
-            ("if_type=71 无线", 71, "Something Unknown", NicKind::Wireless),
+            (
+                "if_type=71 无线",
+                71,
+                "Something Unknown",
+                NicKind::Wireless,
+            ),
             ("if_type=243 WWAN", 243, "Fibocom FM150", NicKind::Wireless),
             ("if_type=244 WWAN2", 244, "Fibocom FM150", NicKind::Wireless),
-            ("if_type=6 压过无线描述", 6, "Intel(R) Wi-Fi 6E AX211", NicKind::Wired),
-            ("if_type=71 压过有线描述", 71, "Realtek PCIe GbE Family", NicKind::Wireless),
+            (
+                "if_type=6 压过无线描述",
+                6,
+                "Intel(R) Wi-Fi 6E AX211",
+                NicKind::Wired,
+            ),
+            (
+                "if_type=71 压过有线描述",
+                71,
+                "Realtek PCIe GbE Family",
+                NicKind::Wireless,
+            ),
             // 未知 IF_TYPE：逐个无线关键字
             ("0/wi-fi", 0, "ASUS Wi-Fi Card", NicKind::Wireless),
             ("0/wifi", 0, "USB WiFi Adapter", NicKind::Wireless),
-            ("0/wireless", 0, "Marvell AVASTAR Wireless-AC", NicKind::Wireless),
+            (
+                "0/wireless",
+                0,
+                "Marvell AVASTAR Wireless-AC",
+                NicKind::Wireless,
+            ),
             ("0/wlan", 0, "Qualcomm WLAN", NicKind::Wireless),
             ("0/802.11", 0, "802.11n USB LAN", NicKind::Wireless),
             // 未知 IF_TYPE：逐个有线关键字
             ("0/ethernet", 0, "Intel Ethernet Connection", NicKind::Wired),
             ("0/gbe", 0, "Realtek PCIe GbE Family", NicKind::Wired),
-            ("0/gb e", 0, "Realtek Gb E Family Network Adapter", NicKind::Wired),
-            ("0/pcie gigabit", 0, "Intel(R) PCIe Gigabit Network Connection", NicKind::Wired),
-            ("0/family controller", 0, "Intel(R) I219-LM Family Controller", NicKind::Wired),
+            (
+                "0/gb e",
+                0,
+                "Realtek Gb E Family Network Adapter",
+                NicKind::Wired,
+            ),
+            (
+                "0/pcie gigabit",
+                0,
+                "Intel(R) PCIe Gigabit Network Connection",
+                NicKind::Wired,
+            ),
+            (
+                "0/family controller",
+                0,
+                "Intel(R) I219-LM Family Controller",
+                NicKind::Wired,
+            ),
             // 未知 IF_TYPE 且两边关键字都不命中 → Other
-            ("0/无关键字", 0, "Microsoft Kernel Debug Network", NicKind::Other),
-            ("1/无关键字", 1, "Software Loopback Interface", NicKind::Other),
+            (
+                "0/无关键字",
+                0,
+                "Microsoft Kernel Debug Network",
+                NicKind::Other,
+            ),
+            (
+                "1/无关键字",
+                1,
+                "Software Loopback Interface",
+                NicKind::Other,
+            ),
             ("24/无关键字", 24, "WAN Miniport (IP)", NicKind::Other),
             ("53/无关键字", 53, "Unknown Device", NicKind::Other),
             // Task 4 边界：Description 为空/空白时不得 panic，也不得凭空归类
@@ -209,7 +274,10 @@ mod tests {
     /// 回退分支里无线判定先于有线判定（简报的实现顺序）：混合关键字时必须是无线。
     #[test]
     fn wireless_keyword_takes_precedence_over_ethernet_keyword() {
-        assert_eq!(classify(0, "Realtek Wireless Ethernet Bridge"), NicKind::Wireless);
+        assert_eq!(
+            classify(0, "Realtek Wireless Ethernet Bridge"),
+            NicKind::Wireless
+        );
         assert_eq!(classify(0, "802.11 Ethernet Adapter"), NicKind::Wireless);
     }
 
@@ -251,7 +319,10 @@ mod tests {
     #[test]
     fn virtual_keywords_each_detectable() {
         let hits: [(&str, &str); 13] = [
-            ("virtual", "Cisco AnyConnect Secure Mobility Virtual Adapter"),
+            (
+                "virtual",
+                "Cisco AnyConnect Secure Mobility Virtual Adapter",
+            ),
             ("hyper-v", "Hyper-V Network Adapter"),
             ("vmware", "VMware Network Adapter VMnet8"),
             ("virtualbox", "VirtualBox Host-Only Network Adapter"),

@@ -5,7 +5,7 @@
 use windows::core::{PSTR, PWSTR};
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::System::Diagnostics::Debug::{
-    FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
+    FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
 };
 
 /// str → UTF-16 + 结尾 0。
