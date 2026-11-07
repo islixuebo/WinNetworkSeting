@@ -1,8 +1,7 @@
-// 本模块是阶段1 后续任务（netinfo / netctl / ui / detail）的公共地基，
-// 故在 main.rs 里以 `pub mod winutil;` 挂到 crate 根：从 crate 根可见的 pub 项
-// 不会被 dead_code 判成「未使用」，Task 3+ 逐个接入时不必再挂 allow 属性。
-// 代价是 clippy 的 missing_safety_doc 会要求给 unsafe fn 写 `# Safety` 章节——
-// 这本来就是裸指针 API 该有的调用约定，写在文档里比写在 allow 里有用。
+// 模块挂载约定（事实描述）：本仓库以 `pub mod winutil;` 挂到 crate 根，
+// 且约定 `pub unsafe fn` 必写 `# Safety` 章节，不使用 `#![allow(dead_code)]`。
+// 注意 `pub mod` 只是把 dead_code 的盲区收得比 blanket allow 更窄——
+// 对未接线的 `pub fn` 它同样是盲区，并非「可见即不死」的保证。
 use windows::core::{PSTR, PWSTR};
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::System::Diagnostics::Debug::{
@@ -32,8 +31,12 @@ pub unsafe fn wstr_from_ptr(p: *const u16) -> String {
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
 }
 
-/// IP_ADAPTER_ADDRESSES_LH 的字符串字段在 windows crate 中声明为 PSTR，
-/// 实际内容是 UTF-16（结构体为 Unicode 版本），需要按宽字符串解读。
+/// 通用工具：把一个「类型标成 PSTR、实际装着 UTF-16 宽字符串」的指针按宽字符串解码。
+///
+/// 警告：**不要**用它读 windows 0.61.3 的 IP_ADAPTER_ADDRESSES_LH 字符串字段——
+/// 该版本里 `DnsSuffix` / `Description` / `FriendlyName` 已声明为 `PWSTR`，
+/// 应直接用 `wstr_from_ptr(x.0)`；只有 `AdapterName` 是真 ANSI，
+/// 喂进本函数会按宽字符解出乱码，还可能因扫不到 2 字节的 0 而越界读。
 ///
 /// # Safety
 /// `p` 必须是 NULL，或确实指向 2 字节对齐、以 0 结尾的 UTF-16 缓冲区。
@@ -62,8 +65,15 @@ pub fn error_text(code: u32) -> String {
         )
     };
     if n > 0 {
-        let s = String::from_utf16_lossy(&buf[..n as usize]);
-        s.trim_end_matches(['\r', '\n', '.']).to_string()
+        // 防御性上界：n 理论上不超过 buf 大小，仍显式夹一次
+        let len = (n as usize).min(buf.len());
+        let s = String::from_utf16_lossy(&buf[..len]);
+        let trimmed = s.trim_end_matches(['\r', '\n', '.']).to_string();
+        if trimmed.is_empty() {
+            format!("错误码 {code}")
+        } else {
+            trimmed
+        }
     } else {
         format!("错误码 {code}")
     }
@@ -100,14 +110,14 @@ mod tests {
         // IP Helper 的字段类型是 PSTR，但里面装的是 UTF-16；这里用真实的宽缓冲区验证 reinterpret 语义
         let text = "以太网";
         let data = wide(text);
-        let p = windows::core::PSTR(data.as_ptr().cast::<u8>().cast_mut());
+        let p = PSTR(data.as_ptr().cast::<u8>().cast_mut());
         assert_eq!(unsafe { wstr_from_pstr(p) }, text);
         // 逐码元核对：读到的内容必须正好是那块宽缓冲区里结尾 0 之前的全部码元
         // （若按 PSTR 字面语义当 UTF-8 解，这里就会是乱码而不是原串）
         let decoded: Vec<u16> = unsafe { wstr_from_pstr(p) }.encode_utf16().collect();
         assert_eq!(decoded, data[..data.len() - 1]);
         // PSTR 为 NULL 时同样返回空串，不得崩溃
-        assert_eq!(unsafe { wstr_from_pstr(windows::core::PSTR(std::ptr::null_mut())) }, "");
+        assert_eq!(unsafe { wstr_from_pstr(PSTR(std::ptr::null_mut())) }, "");
     }
 
     #[test]
@@ -118,8 +128,13 @@ mod tests {
     }
 
     #[test]
-    fn error_text_for_unknown_code_still_returns() {
-        let s = error_text(0xE000_FFFF);
-        assert!(s.contains("错误码") || !s.is_empty());
+    fn error_text_for_unknown_code_falls_back() {
+        // 该码已由探针实测：FormatMessageW 对它返回 0，必然走「错误码 N」回退分支
+        const CODE: u32 = 0xE000_FFFF;
+        let s = error_text(CODE);
+        // 前缀断言：回退文案以「错误码」开头，报的是码值而不是别的东西
+        assert!(s.starts_with("错误码"), "未走回退分支，实际得到：{s}");
+        // 精确断言：整串只能是「错误码 {十进制码值}」，钉死回退文案本身
+        assert_eq!(s, format!("错误码 {CODE}"));
     }
 }
