@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 pub mod adapterclass;
+pub mod netctl;
 pub mod netinfo;
 pub mod ui;
 pub mod winutil;

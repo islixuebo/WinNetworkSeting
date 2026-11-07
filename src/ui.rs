@@ -1,6 +1,7 @@
 // Task 5：主窗口 —— 分组 ListView、状态栏、状态列着色、缩放跟随。
 // 资源 ID 的单一来源在本模块（res/resource.h 是 rc 侧的单一来源，两边数值必须一致）。
 use crate::adapterclass::{kind_name, NicKind};
+use crate::netctl;
 use crate::netinfo::{self, Nic};
 use crate::winutil::wide;
 use std::sync::{Mutex, OnceLock};
@@ -11,13 +12,18 @@ use windows::Win32::UI::Controls::{
     InitCommonControlsEx, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT,
     CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, ICC_BAR_CLASSES,
     ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVGF_GROUPID,
-    LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW,
-    LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETITEMTEXTW,
-    NMHDR, NM_CUSTOMDRAW, NMLVCUSTOMDRAW, SB_SETPARTS, SB_SETTEXTW,
+    LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_TEXT, LVITEMW, LVNI_SELECTED, LVM_DELETEALLITEMS,
+    LVM_ENABLEGROUPVIEW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW,
+    LVM_REMOVEALLGROUPS, LVM_SETITEMTEXTW, LVN_ITEMCHANGED, NMHDR, NM_CUSTOMDRAW, NMLVCUSTOMDRAW,
+    SB_SETPARTS, SB_SETTEXTW,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetDlgItem, GetWindowRect, MoveWindow, SendMessageW, WM_CLOSE, WM_COMMAND,
-    WM_INITDIALOG, WM_NOTIFY, WM_SIZE,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos,
+    GetDlgItem, GetWindowRect, IDYES, MessageBoxW, MoveWindow, SendMessageW, TrackPopupMenu,
+    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING,
+    TPM_LEFTALIGN, TPM_TOPALIGN, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_INITDIALOG, WM_NOTIFY,
+    WM_SIZE,
 };
 
 pub const IDD_MAIN: u32 = 100;
@@ -240,24 +246,170 @@ pub unsafe fn set_status(hwnd: HWND, text: &str) {
 /// # Safety
 /// `hwnd` 是主对话框。
 pub unsafe fn refresh_list(hwnd: HWND) {
+    // 顺序要紧：先 populate 再写 state。populate 里发的每条 ListView 消息都可能回调进
+    // dlgproc（LVN_ITEMCHANGED → sync_buttons → selected_nic 又要拿锁），
+    // 持锁跨 SendMessage 会在同一线程上自死锁。
     match netinfo::list() {
         Ok(nics) => {
             let text = format!("共 {} 个物理网卡", nics.len());
+            let snapshot = nics.clone();
+            populate(hwnd, &snapshot);
             *lock_state() = AppState { nics, err: None };
-            let guard = lock_state();
-            populate(hwnd, &guard.nics);
-            drop(guard);
             set_status(hwnd, &text);
         }
         Err(e) => {
+            populate(hwnd, &[]);
             *lock_state() = AppState {
                 nics: Vec::new(),
                 err: Some(e.clone()),
             };
-            populate(hwnd, &[]);
             set_status(hwnd, &format!("读取网卡信息失败：{e}"));
         }
     }
+}
+
+/// 当前选中行号。分组视图下 LVM_GETNEXTITEM 返回的是插入序（= state().nics 下标），
+/// 不是显示序，所以可以直接用来回查数据。
+///
+/// # Safety
+/// `hl` 是主对话框的 ListView 控件。
+pub unsafe fn selected_index(hl: HWND) -> Option<usize> {
+    if hl.is_invalid() {
+        return None;
+    }
+    let i = SendMessageW(
+        hl,
+        LVM_GETNEXTITEM,
+        Some(WPARAM(usize::MAX)),
+        Some(LPARAM(LVNI_SELECTED as isize)),
+    )
+    .0;
+    if i < 0 {
+        None
+    } else {
+        Some(i as usize)
+    }
+}
+
+/// 返回拷贝而不是引用：调用方要在不持锁的情况下跑完 netsh / 弹窗。
+///
+/// # Safety
+/// `hl` 是主对话框的 ListView 控件。
+pub unsafe fn selected_nic(hl: HWND) -> Option<Nic> {
+    let idx = selected_index(hl)?;
+    let guard = lock_state();
+    guard.nics.get(idx).cloned()
+}
+
+/// 按选中行的状态同步「启用/禁用」按钮可用态；未选中时两个都置灰。
+///
+/// # Safety
+/// `hwnd` 是主对话框，`hl` 是其 ListView 控件。
+pub unsafe fn sync_buttons(hwnd: HWND, hl: HWND) {
+    let (has_sel, en_state) = match selected_nic(hl) {
+        Some(n) => (true, n.enabled),
+        None => (false, true),
+    };
+    let h_en = GetDlgItem(Some(hwnd), IDC_ENABLE as i32).unwrap_or_default();
+    let h_dis = GetDlgItem(Some(hwnd), IDC_DISABLE as i32).unwrap_or_default();
+    if !h_en.is_invalid() {
+        let _ = EnableWindow(h_en, has_sel && !en_state);
+    }
+    if !h_dis.is_invalid() {
+        let _ = EnableWindow(h_dis, has_sel && en_state);
+    }
+}
+
+/// 在光标处弹出启用/禁用菜单。不带 TPM_RETURNCMD：选中项由系统以 WM_COMMAND
+/// 投给 owner 对话框，与按钮走同一条分发路径。
+///
+/// # Safety
+/// `hwnd` 是主对话框，`hl` 是其 ListView 控件。
+pub unsafe fn show_popup_menu(hwnd: HWND, hl: HWND) {
+    let Ok(hmenu) = CreatePopupMenu() else {
+        set_status(hwnd, "创建右键菜单失败");
+        return;
+    };
+    let (has_sel, en_state) = match selected_nic(hl) {
+        Some(n) => (true, n.enabled),
+        None => (false, true),
+    };
+    let menus = [
+        (IDM_ENABLE, "启用", has_sel && !en_state),
+        (IDM_DISABLE, "禁用", has_sel && en_state),
+    ];
+    for (id, label, usable) in menus {
+        let flags = if usable { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let text = wide(label);
+        let _ = AppendMenuW(hmenu, flags, id as usize, PCWSTR(text.as_ptr()));
+    }
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let _ = TrackPopupMenu(
+        hmenu,
+        TPM_TOPALIGN | TPM_LEFTALIGN,
+        pt.x,
+        pt.y,
+        Some(0),
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(hmenu);
+}
+
+/// 禁用会不会切断当前默认路由 —— 需要用户确认的唯一条件。
+/// 已禁用的卡再点一次「禁用」不会断网，不必打扰用户。
+pub fn needs_disable_confirm(n: &Nic) -> bool {
+    n.is_default_route && n.enabled
+}
+
+/// 确认框答复 → 是否继续执行。单独拆出来是因为弹窗本身没法在单测里点，
+/// 而这一行的方向反了就是「点是」不干活、点「否」反而断网。
+fn disable_approved(r: MESSAGEBOX_RESULT) -> bool {
+    r == IDYES
+}
+
+/// 禁用默认路由网卡前必须确认；返回 false 表示用户取消。
+/// 非默认路由、或本来就已禁用的网卡不会断网，不打扰用户。
+pub fn confirm_disable_default_route(n: &Nic) -> bool {
+    if !needs_disable_confirm(n) {
+        return true;
+    }
+    unsafe {
+        let title = wide("警告");
+        let body = wide(&format!(
+            "「{}」是当前默认路由所在的网卡，禁用会立即断网。\n\n确定要禁用吗？",
+            n.alias
+        ));
+        let r = MessageBoxW(None, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONWARNING);
+        disable_approved(r)
+    }
+}
+
+/// 按钮与右键菜单共用的执行体：确认 → 调用 netctl → 反馈 → 重采集。
+///
+/// # Safety
+/// `hwnd` 是主对话框，`hl` 是其 ListView 控件。
+pub unsafe fn on_toggle(hwnd: HWND, hl: HWND, enable: bool) {
+    let Some(n) = selected_nic(hl) else {
+        set_status(hwnd, "未选择网卡");
+        return;
+    };
+    if !enable && !confirm_disable_default_route(&n) {
+        return;
+    }
+    let verb = if enable { "启用" } else { "禁用" };
+    set_status(hwnd, &format!("正在{verb}「{}」…", n.alias));
+    if let Err(e) = netctl::set_enabled(n.if_index, &n.alias, enable) {
+        let title = wide("错误");
+        let body = wide(&format!("{verb}「{}」失败：{e}", n.alias));
+        let _ = MessageBoxW(Some(hwnd), PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+        set_status(hwnd, &format!("{verb}「{}」失败", n.alias));
+    } else {
+        set_status(hwnd, &format!("已{verb}「{}」", n.alias));
+    }
+    refresh_list(hwnd);
+    sync_buttons(hwnd, hl);
 }
 
 /// COLORREF 是 0x00BBGGRR（不是 RGB 顺序），这里显式拼以免依赖绑定里是否存在 RGB 宏。
@@ -380,14 +532,25 @@ pub unsafe extern "system" fn main_dlgproc(
             init_status_bar(hwnd);
             refresh_list(hwnd);
             layout(hwnd);
+            sync_buttons(hwnd, list_view(hwnd));
             1
         }
         WM_COMMAND => {
+            let hl = list_view(hwnd);
             match (wparam.0 & 0xFFFF) as u32 {
-                IDC_REFRESH => refresh_list(hwnd),
-                // 启用/禁用/详情/DNS 由 Task 6、Task 7 接线
+                IDC_REFRESH => {
+                    refresh_list(hwnd);
+                    sync_buttons(hwnd, hl);
+                }
+                IDC_ENABLE | IDM_ENABLE => on_toggle(hwnd, hl, true),
+                IDC_DISABLE | IDM_DISABLE => on_toggle(hwnd, hl, false),
+                // 刷新 DNS 缓存、详细信息由 Task 7/阶段2 接线
                 _ => return 0,
             }
+            1
+        }
+        WM_CONTEXTMENU => {
+            show_popup_menu(hwnd, list_view(hwnd));
             1
         }
         WM_NOTIFY => {
@@ -395,6 +558,10 @@ pub unsafe extern "system" fn main_dlgproc(
                 return 0;
             }
             let nmh = &mut *(lparam.0 as *mut NMHDR);
+            if nmh.code == LVN_ITEMCHANGED && nmh.hwndFrom == list_view(hwnd) {
+                sync_buttons(hwnd, nmh.hwndFrom);
+                return 0;
+            }
             on_list_notify(hwnd, nmh).unwrap_or(0)
         }
         WM_SIZE => {
@@ -447,6 +614,48 @@ mod tests {
         let n = nic(false, true, NicKind::Wireless, "WLAN");
         assert_eq!(status_text(&n), "已禁用");
         assert_ne!(status_text(&n), "已连接");
+    }
+
+    /// 确认门只在「禁用会真的断网」时成立：非默认路由不会断、已禁用的卡再禁也不会断。
+    #[test]
+    fn only_default_route_disable_needs_confirm() {
+        let routed = Nic {
+            is_default_route: true,
+            ..nic(true, true, NicKind::Wired, "以太网")
+        };
+        assert!(needs_disable_confirm(&routed));
+        let routed_off = Nic {
+            is_default_route: true,
+            ..nic(false, false, NicKind::Wired, "以太网")
+        };
+        assert!(!needs_disable_confirm(&routed_off));
+        assert!(!needs_disable_confirm(&nic(true, true, NicKind::Wireless, "WLAN")));
+    }
+
+    /// 未触发确认门时不得弹窗，直接放行（这条同时锁住「取消语义」：true = 继续执行）。
+    #[test]
+    fn confirm_passes_through_without_dialog() {
+        assert!(confirm_disable_default_route(&nic(
+            true,
+            true,
+            NicKind::Wireless,
+            "WLAN"
+        )));
+        assert!(confirm_disable_default_route(&nic(
+            false,
+            false,
+            NicKind::Wired,
+            "以太网"
+        )));
+    }
+
+    /// 「是」= 继续执行，「否」= 取消。方向写反会让确认框变成一个陷阱。
+    #[test]
+    fn yes_approves_and_no_cancels() {
+        use windows::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDNO};
+        assert!(disable_approved(IDYES));
+        assert!(!disable_approved(IDNO));
+        assert!(!disable_approved(IDCANCEL));
     }
 
     #[test]
