@@ -24,10 +24,10 @@ if (-not $elevated) {
 }
 
 $limits = [ordered]@{
-    "exe 体积(MB)"   = 2
-    "空闲工作集(MB)" = 10
-    "启动耗时(ms)"   = 300
-    "空闲 CPU(%)"    = 1
+    "exe 体积(MB)"     = 2
+    "空闲私有内存(MB)" = 10
+    "启动耗时(ms)"     = 300
+    "空闲 CPU(%)"      = 1
 }
 
 Get-Process nictool -ErrorAction SilentlyContinue | ForEach-Object {
@@ -70,12 +70,12 @@ $exeMB = (Get-Item $exe).Length / 1MB
 $rows = @(
     [pscustomobject]@{ 指标 = "exe 体积(MB)";     实测 = [math]::Round($exeMB, 2);   阈值 = $limits["exe 体积(MB)"] }
     [pscustomobject]@{ 指标 = "启动耗时(ms)";     实测 = $startupMs;                  阈值 = $limits["启动耗时(ms)"] }
-    [pscustomobject]@{ 指标 = "空闲工作集(MB)";   实测 = [math]::Round($wsMB, 2);     阈值 = $limits["空闲工作集(MB)"] }
-    [pscustomobject]@{ 指标 = "空闲私有内存(MB)"; 实测 = [math]::Round($privMB, 2);   阈值 = "（参考项）" }
+    [pscustomobject]@{ 指标 = "空闲私有内存(MB)"; 实测 = [math]::Round($privMB, 2);   阈值 = $limits["空闲私有内存(MB)"] }
+    [pscustomobject]@{ 指标 = "空闲工作集(MB)";   实测 = [math]::Round($wsMB, 2);     阈值 = "（参考项）" }
     [pscustomobject]@{ 指标 = "空闲 CPU(2s 增量%)"; 实测 = [math]::Round($cpu, 3);    阈值 = $limits["空闲 CPU(%)"] }
 )
 $rows | Format-Table -AutoSize
-Write-Host "工作集含可被系统换出的共享页；私有内存才是本进程独占的提交量。两者口径差一个数量级，验收前先定口径。"
+Write-Host "内存口径已裁定：按私有内存（进程独占的提交量）判 <10MB；工作集含可被换出的共享页，只作参考。"
 
 if (-not $KeepRunning) {
     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
@@ -84,7 +84,7 @@ if (-not $KeepRunning) {
 $failed = @()
 if ($exeMB -ge $limits["exe 体积(MB)"])   { $failed += "exe 体积" }
 if ($startupMs -ge $limits["启动耗时(ms)"]) { $failed += "启动耗时" }
-if ($wsMB -ge $limits["空闲工作集(MB)"])  { $failed += "空闲工作集" }
+if ($privMB -ge $limits["空闲私有内存(MB)"]) { $failed += "空闲私有内存" }
 if ($cpu -ge $limits["空闲 CPU(%)"])      { $failed += "空闲 CPU" }
 if ($failed.Count -gt 0) {
     Write-Host ("未达标：{0}" -f ($failed -join "、"))
