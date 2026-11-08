@@ -257,6 +257,26 @@ pub fn flush_dns() -> Result<(), String> {
     run_netadapter(&flush_dns_args())
 }
 
+pub fn new_route_args(if_index: u32, prefix: &str, next_hop: &str, metric: u32) -> Vec<String> {
+    ps_args(&format!(
+        "New-NetRoute -InterfaceIndex {if_index} -DestinationPrefix {prefix} -NextHop {next_hop} -RouteMetric {metric} -Confirm:$False"
+    ))
+}
+
+pub fn remove_route_args(if_index: u32, prefix: &str, next_hop: &str) -> Vec<String> {
+    ps_args(&format!(
+        "Remove-NetRoute -InterfaceIndex {if_index} -DestinationPrefix {prefix} -NextHop {next_hop} -Confirm:$False"
+    ))
+}
+
+pub fn add_route(if_index: u32, prefix: &str, next_hop: &str, metric: u32) -> Result<(), String> {
+    run_netadapter(&new_route_args(if_index, prefix, next_hop, metric))
+}
+
+pub fn remove_route(if_index: u32, prefix: &str, next_hop: &str) -> Result<(), String> {
+    run_netadapter(&remove_route_args(if_index, prefix, next_hop))
+}
+
 #[derive(Clone)]
 pub struct IpConfig {
     pub if_index: u32,
@@ -456,6 +476,27 @@ mod tests {
         assert_eq!(
             failure_text("netsh", Some(1), b"\n \n", b""),
             "netsh 退出码 1"
+        );
+    }
+
+    #[test]
+    fn new_route_uses_prefix_and_next_hop() {
+        let a = new_route_args(19, "10.20.0.0/24", "10.20.0.1", 50);
+        assert!(
+            a[3].ends_with("New-NetRoute -InterfaceIndex 19 -DestinationPrefix 10.20.0.0/24 -NextHop 10.20.0.1 -RouteMetric 50 -Confirm:$False"),
+            "{}",
+            a[3]
+        );
+    }
+
+    /// 删除必须同时带目的前缀和下一跳：只给前缀会删掉同前缀的多条路由。
+    #[test]
+    fn remove_route_scopes_by_prefix_and_hop() {
+        let a = remove_route_args(19, "10.20.0.0/24", "10.20.0.1");
+        assert!(
+            a[3].ends_with("Remove-NetRoute -InterfaceIndex 19 -DestinationPrefix 10.20.0.0/24 -NextHop 10.20.0.1 -Confirm:$False"),
+            "{}",
+            a[3]
         );
     }
 

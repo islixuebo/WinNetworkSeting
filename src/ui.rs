@@ -24,10 +24,11 @@ use windows::Win32::UI::Controls::{
     CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT,
     ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
     LVGF_GROUPID, LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_PARAM, LVIF_TEXT, LVITEMW,
-    LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED, LVN_ITEMCHANGED,
-    LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, SB_SETPARTS, SB_SETTEXTW,
+    LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_GETITEMCOUNT, LVM_GETITEMTEXTW, LVM_GETITEMW,
+    LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS,
+    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED,
+    LVN_ITEMCHANGED, LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, SB_SETPARTS,
+    SB_SETTEXTW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -930,6 +931,133 @@ pub unsafe fn on_flush_dns(hwnd: HWND) {
     }
 }
 
+/// 删除默认路由前的断网告警；其它路由返回空串。
+pub fn route_delete_warning(prefix: &str) -> &'static str {
+    if crate::validate::is_default_prefix(prefix) {
+        "这是默认路由（0.0.0.0/0），删除后本机将立即断网。\n确定删除？"
+    } else {
+        ""
+    }
+}
+
+/// 读路由列表当前选中行：目标、下一跳、ifIndex（lParam 里存的，不按名字反查）。
+unsafe fn selected_route(hl: HWND) -> Option<(String, String, u32)> {
+    let idx = SendMessageW(
+        hl,
+        LVM_GETNEXTITEM,
+        Some(WPARAM(usize::MAX)),
+        Some(LPARAM(LVNI_SELECTED as isize)),
+    )
+    .0 as i32;
+    if idx < 0 {
+        return None;
+    }
+    let cell = |sub: i32| -> String {
+        let mut text = [0u16; 128];
+        let mut item = LVITEMW {
+            iSubItem: sub,
+            pszText: PWSTR(text.as_mut_ptr()),
+            cchTextMax: text.len() as i32,
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            hl,
+            LVM_GETITEMTEXTW,
+            Some(WPARAM(idx as usize)),
+            Some(LPARAM(&mut item as *mut LVITEMW as isize)),
+        );
+        crate::winutil::wstr_from_ptr(text.as_ptr())
+    };
+    let mut item = LVITEMW {
+        iItem: idx,
+        mask: LVIF_PARAM,
+        ..Default::default()
+    };
+    let _ = SendMessageW(
+        hl,
+        LVM_GETITEMW,
+        Some(WPARAM(0)),
+        Some(LPARAM(&mut item as *mut LVITEMW as isize)),
+    );
+    Some((cell(0), cell(1), item.lParam.0 as u32))
+}
+
+/// 路由页的「删除路由」按选中态启停。
+///
+/// # Safety
+/// `hv` 是路由 ListView（`IDC_ROUTE_LIST`）。
+pub unsafe fn sync_route_buttons(hwnd: HWND, hv: HWND) {
+    if let Ok(h_del) = GetDlgItem(Some(hwnd), IDC_ROUTE_DEL as i32) {
+        let has_sel = SendMessageW(
+            hv,
+            LVM_GETNEXTITEM,
+            Some(WPARAM(usize::MAX)),
+            Some(LPARAM(LVNI_SELECTED as isize)),
+        )
+        .0 >= 0;
+        let _ = EnableWindow(h_del, has_sel);
+    }
+}
+
+/// 删除选中路由；默认路由要额外确认。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn on_route_delete(hwnd: HWND) {
+    let hl = GetDlgItem(Some(hwnd), IDC_ROUTE_LIST as i32).unwrap_or_default();
+    let Some((prefix, hop, if_index)) = selected_route(hl) else {
+        set_status(hwnd, "未选择路由");
+        return;
+    };
+    let warn = route_delete_warning(&prefix);
+    let (text, title) = if warn.is_empty() {
+        (format!("删除路由 {prefix} → {hop}？"), "删除路由")
+    } else {
+        (warn.to_string(), "断网风险")
+    };
+    let body = wide(&text);
+    let t = wide(title);
+    if MessageBoxW(
+        Some(hwnd),
+        PCWSTR(body.as_ptr()),
+        PCWSTR(t.as_ptr()),
+        MB_YESNO | MB_ICONWARNING,
+    ) != IDYES
+    {
+        return;
+    }
+    match netctl::remove_route(if_index, &prefix, &hop) {
+        Ok(()) => {
+            set_status(hwnd, &format!("已删除路由 {prefix}"));
+            refresh_routes(hwnd);
+            sync_route_buttons(hwnd, hl);
+        }
+        Err(e) => set_status(hwnd, &format!("删除路由失败：{e}")),
+    }
+}
+
+/// 「添加路由」：填表后按 ifIndex 写持久路由。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn on_route_add(hwnd: HWND) {
+    let nics = lock_state().nics.clone();
+    if nics.is_empty() {
+        set_status(hwnd, "暂无可用网卡：先刷新网卡列表");
+        return;
+    }
+    let Some(draft) = crate::forms::route_dialog(hwnd, &nics) else {
+        return;
+    };
+    match netctl::add_route(draft.if_index, &draft.prefix, &draft.next_hop, draft.metric) {
+        Ok(()) => {
+            set_status(hwnd, &format!("已添加路由 {}", draft.prefix));
+            refresh_routes(hwnd);
+        }
+        Err(e) => set_status(hwnd, &format!("添加路由失败：{e}")),
+    }
+}
+
 /// 在光标处弹出启用/禁用菜单。不带 TPM_RETURNCMD：选中项由系统以 WM_COMMAND
 /// 投给 owner 对话框，与按钮走同一条分发路径。
 ///
@@ -1487,6 +1615,8 @@ pub unsafe extern "system" fn main_dlgproc(
                 IDC_FLUSH_DNS => on_flush_dns(hwnd),
                 IDC_RESET => on_reset(hwnd),
                 IDC_ROUTE_REFRESH => refresh_routes(hwnd),
+                IDC_ROUTE_ADD => on_route_add(hwnd),
+                IDC_ROUTE_DEL => on_route_delete(hwnd),
                 _ => return 0,
             }
             1
@@ -1503,6 +1633,14 @@ pub unsafe extern "system" fn main_dlgproc(
             if nmh.code == LVN_ITEMCHANGED && nmh.hwndFrom == list_view(hwnd) {
                 sync_buttons(hwnd, nmh.hwndFrom);
                 return 0;
+            }
+            if nmh.code == LVN_ITEMCHANGED {
+                if let Ok(hv) = GetDlgItem(Some(hwnd), IDC_ROUTE_LIST as i32) {
+                    if nmh.hwndFrom == hv {
+                        sync_route_buttons(hwnd, hv);
+                        return 0;
+                    }
+                }
             }
             match on_list_notify(hwnd, nmh) {
                 Some(result) => {
@@ -1630,6 +1768,12 @@ mod tests {
     #[test]
     fn reset_warning_mentions_reboot() {
         assert!(reset_warning().contains("重启"));
+    }
+
+    #[test]
+    fn deleting_default_route_warns_about_disconnect() {
+        assert!(route_delete_warning("0.0.0.0/0").contains("断网"));
+        assert_eq!(route_delete_warning("10.20.0.0/24"), "");
     }
 
     /// 改 IP 的断网告警只在默认路由网卡上出现，否则每次点「确定」都白弹一次。

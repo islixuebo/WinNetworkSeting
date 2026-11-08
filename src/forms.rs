@@ -12,9 +12,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DialogBoxParamW, EndDialog, GetClientRect, GetDlgItem, GetWindowTextLengthW,
     GetWindowTextW, MessageBoxW, SendMessageW, SetWindowTextW, BS_AUTOCHECKBOX, BS_GROUPBOX,
-    BS_PUSHBUTTON, DLGPROC, ES_AUTOHSCROLL, HMENU, MB_ICONWARNING, MB_OK, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_ERASEBKGND,
-    WM_INITDIALOG, WM_SETFONT, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
+    BS_PUSHBUTTON, CBS_DROPDOWNLIST, DLGPROC, ES_AUTOHSCROLL, HMENU, MB_ICONWARNING, MB_OK,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC,
+    WM_ERASEBKGND, WM_INITDIALOG, WM_SETFONT, WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::netinfo::Nic;
@@ -568,9 +568,240 @@ unsafe extern "system" fn nic_cfg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, _l:
     }
 }
 
+// ---------------- 添加路由对话框 ----------------
+
+const IDD_ROUTE: u32 = 104;
+const ROUTE_COMBO: u32 = 4200;
+const ROUTE_PREFIX: u32 = 4201;
+const ROUTE_HOP: u32 = 4202;
+const ROUTE_METRIC: u32 = 4203;
+
+const CB_ADDSTRING: u32 = 0x0143;
+const CB_GETCURSEL: u32 = 0x0147;
+const CB_SETCURSEL: u32 = 0x014E;
+const CB_GETITEMDATA: u32 = 0x0150;
+const CB_SETITEMDATA: u32 = 0x0151;
+
+#[derive(Clone)]
+pub struct RouteDraft {
+    pub if_index: u32,
+    pub prefix: String,
+    pub next_hop: String,
+    pub metric: u32,
+}
+
+/// 路由表单校验；ifIndex 由对话框按下拉选择覆盖（抽出来便于单测）。
+pub fn parse_route_fields(prefix: &str, next_hop: &str, metric: &str) -> Result<RouteDraft, String> {
+    let prefix = crate::validate::route_prefix(prefix)?;
+    let hop = crate::validate::parse_ipv4(next_hop)
+        .ok_or_else(|| "下一跳不是合法的 IPv4 地址".to_string())?;
+    let metric: u32 = metric
+        .trim()
+        .parse()
+        .map_err(|_| "跃点必须是正整数".to_string())?;
+    Ok(RouteDraft {
+        if_index: 0,
+        prefix,
+        next_hop: hop.to_string(),
+        metric,
+    })
+}
+
+type RouteState = (Vec<(String, u32)>, Option<RouteDraft>);
+
+thread_local! {
+    static ROUTE: RefCell<RouteState> = const { RefCell::new((Vec::new(), None)) };
+}
+
+/// 弹出「添加路由」；取消返回 `None`。
+pub fn route_dialog(parent: HWND, nics: &[Nic]) -> Option<RouteDraft> {
+    let entries: Vec<(String, u32)> = nics
+        .iter()
+        .map(|n| (format!("{} ({})", n.alias, n.if_index), n.if_index))
+        .collect();
+    ROUTE.with(|r| *r.borrow_mut() = (entries, None));
+    unsafe {
+        let Ok(hmodule) = GetModuleHandleW(None) else {
+            return None;
+        };
+        let dlg: DLGPROC = Some(route_proc);
+        let r = DialogBoxParamW(
+            Some(HINSTANCE(hmodule.0)),
+            crate::ui::resource_id(IDD_ROUTE),
+            Some(parent),
+            dlg,
+            LPARAM(0),
+        );
+        if r == 0 {
+            None
+        } else {
+            ROUTE.with(|x| x.borrow().1.clone())
+        }
+    }
+}
+
+/// # Safety
+/// `parent` 必须是当前线程上存活、已创建的对话框。
+unsafe fn add_combo(parent: HWND, x: i32, y: i32, w: i32, h: i32, id: u32) -> HWND {
+    create(
+        parent,
+        "COMBOBOX",
+        "",
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | WS_VSCROLL
+            | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+        x,
+        y,
+        w,
+        h,
+        id,
+    )
+}
+
+unsafe fn build_route_controls(hwnd: HWND) {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let cx = (rc.right - rc.left).max(360);
+    let cy = (rc.bottom - rc.top).max(220);
+    let margin = 12;
+    let edit_x = margin + 76;
+    let edit_w = (cx - edit_x - margin).max(150);
+
+    add_label(hwnd, margin, 18, 64, "接口");
+    let combo = add_combo(hwnd, edit_x, 16, edit_w, 200, ROUTE_COMBO);
+    let entries = ROUTE.with(|r| r.borrow().0.clone());
+    for (label, if_index) in entries.iter() {
+        let t = wide(label);
+        let idx = SendMessageW(
+            combo,
+            CB_ADDSTRING,
+            None,
+            Some(LPARAM(t.as_ptr() as isize)),
+        )
+        .0 as i32;
+        if idx >= 0 {
+            SendMessageW(
+                combo,
+                CB_SETITEMDATA,
+                Some(WPARAM(idx as usize)),
+                Some(LPARAM(*if_index as isize)),
+            );
+        }
+    }
+    if !entries.is_empty() {
+        SendMessageW(
+            combo,
+            CB_SETCURSEL,
+            Some(WPARAM(0)),
+            None,
+        );
+    }
+
+    add_label(hwnd, margin, 56, 64, "目标前缀");
+    add_edit(hwnd, edit_x, 52, edit_w, "", ROUTE_PREFIX);
+    add_label(hwnd, margin, 88, 64, "下一跳");
+    add_edit(hwnd, edit_x, 84, edit_w, "", ROUTE_HOP);
+    add_label(hwnd, margin, 120, 64, "跃点");
+    add_edit(hwnd, edit_x, 116, 120, "0", ROUTE_METRIC);
+
+    let buttons_y = cy - 40;
+    add_button(hwnd, cx - margin - 68 - 8 - 68, buttons_y, 68, "确定", 1);
+    add_button(hwnd, cx - margin - 68, buttons_y, 68, "取消", 2);
+}
+
+unsafe fn accept_route(hwnd: HWND) -> isize {
+    let mut errors = Vec::new();
+    let combo = GetDlgItem(Some(hwnd), ROUTE_COMBO as i32).unwrap_or_default();
+    let sel = SendMessageW(combo, CB_GETCURSEL, None, None).0 as i32;
+    let if_index = if sel < 0 {
+        errors.push("请选择接口".to_string());
+        0
+    } else {
+        SendMessageW(
+            combo,
+            CB_GETITEMDATA,
+            Some(WPARAM(sel as usize)),
+            None,
+        )
+        .0 as u32
+    };
+    let mut draft = match parse_route_fields(
+        &read_edit(hwnd, ROUTE_PREFIX),
+        &read_edit(hwnd, ROUTE_HOP),
+        &read_edit(hwnd, ROUTE_METRIC),
+    ) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            errors.push(e);
+            None
+        }
+    };
+    if !errors.is_empty() {
+        show_errors(hwnd, &errors);
+        return 1;
+    }
+    if let Some(d) = draft.as_mut() {
+        d.if_index = if_index;
+    }
+    ROUTE.with(|r| r.borrow_mut().1 = draft);
+    let _ = EndDialog(hwnd, 1);
+    1
+}
+
+unsafe extern "system" fn route_proc(hwnd: HWND, msg: u32, wparam: WPARAM, _l: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            crate::ui::set_title_icons(hwnd);
+            build_route_controls(hwnd);
+            1
+        }
+        WM_ERASEBKGND => {
+            fill_background(hwnd, wparam);
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, theme::TEXT);
+            GetSysColorBrush(COLOR_WINDOW).0 as isize
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u32;
+            match id {
+                1 => accept_route(hwnd),
+                2 => {
+                    let _ = EndDialog(hwnd, 0);
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_CLOSE => {
+            let _ = EndDialog(hwnd, 0);
+            1
+        }
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_fields_normalize_and_validate() {
+        let d = parse_route_fields(" 10.20.0.9/24 ", "10.20.0.1", " 50 ").unwrap();
+        assert_eq!(d.prefix, "10.20.0.0/24");
+        assert_eq!(d.next_hop, "10.20.0.1");
+        assert_eq!(d.metric, 50);
+        // 默认路由也是合法输入（删除侧才做断网告警）
+        assert_eq!(parse_route_fields("0.0.0.0/0", "10.0.0.1", "0").unwrap().prefix, "0.0.0.0/0");
+        assert!(parse_route_fields("10.20.0.0", "10.20.0.1", "5").is_err(), "缺前缀长度");
+        assert!(parse_route_fields("10.20.0.0/24", "no", "5").is_err(), "下一跳非法");
+        assert!(parse_route_fields("10.20.0.0/24", "10.20.0.1", "x").is_err(), "跃点非数字");
+    }
 
     #[test]
     fn metric_field_parses_auto_and_numbers() {
