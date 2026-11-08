@@ -33,14 +33,16 @@ WPF 版（同仓库上一代实现）留在外层目录作对照，本目录是�
 
 ## 构建
 
-前置：Rust 工具链（`aarch64-pc-windows-msvc`）+ VS 2022 Build Tools 的 C++ 工作负载（含 ARM64）。
+前置：Rust 工具链（`aarch64-pc-windows-msvc`；要出 x64 版再加 `x86_64-pc-windows-msvc`）
++ VS 2022 Build Tools 的 C++ 工作负载（含 ARM64 与 x64）。
 `build.ps1` 会把 `vcvarsall.bat` 的环境（`cl`/`link` 与 `INCLUDE`）导入当前会话 ——
 `INCLUDE` 缺失时 `rc.exe` 编译资源会报 RC1015，这一步不能省。
 
     powershell -ExecutionPolicy Bypass -File build.ps1
+    powershell -ExecutionPolicy Bypass -File build.ps1 -Target x86_64-pc-windows-msvc
     powershell -File check_metrics.ps1
 
-产物：`target\aarch64-pc-windows-msvc\release\nictool.exe`。
+产物：`target\<target-triple>\release\nictool.exe`（如 `aarch64-pc-windows-msvc`、`x86_64-pc-windows-msvc`）。
 exe 带 `requireAdministrator` manifest，双击或 `Start-Process` 都会走 UAC。
 构建前需关闭正在运行的窗口，否则链接步骤无法替换被锁住的 exe。
 
@@ -60,6 +62,7 @@ exe 带 `requireAdministrator` manifest，双击或 `Start-Process` 都会走 UA
 
 内存口径已定：按**私有内存 <10MB** 判定（进程独占的提交量）。工作集含可被系统换出的共享页
 （comctl/uxtheme 等），本机实测比私有量高一个数量级，脚本里只作参考项打印，不参与达标判定。
+x64 产物在 ARM64 机器上由 Prism 模拟运行，启动耗时与私有内存不具代表性，需在真实 x64 机器复测。
 
 ## 实现说明
 
