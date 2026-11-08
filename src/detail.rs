@@ -1,8 +1,8 @@
 //! 网卡详情对话框：只读展示单张网卡的 11 项信息。
 //!
-//! 模板（`IDD_DETAIL`）是空的，行在 `WM_INITDIALOG` 里按实际条数动态创建，
-//! 这样新增/删减字段只改 `build_rows`，不用动 .rc。
-//! 浅色精修：白底、灰标签 / 深色值、状态值带语义色、Segoe UI 大行距、底部关闭按钮；
+//! 模板（`IDD_DETAIL`）是空的，内容在 `WM_PAINT` 里整块自绘（与主列表同一套浅色语言）：
+//! 白底 + 隔行浅灰、左列灰标签 / 右列深色值、状态行用圆角胶囊、底部真实「关闭」按钮。
+//! 不用一堆 STATIC + WM_CTLCOLOR*（实测那套会留下灰底白块拼贴），自绘保证每个像素可控。
 //! 窗口高度按「客户区期望 + 实测非客户区」算，不再猜标题栏像素，避免末行被裁。
 
 use crate::adapterclass::kind_name;
@@ -13,41 +13,42 @@ use std::cell::RefCell;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetStockObject, SetBkColor, SetTextColor, HBRUSH, HDC, WHITE_BRUSH,
+    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, SelectObject,
+    SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC,
+    HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DialogBoxParamW, EndDialog, GetClientRect, GetDlgCtrlID, GetWindowRect,
-    SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, BS_PUSHBUTTON, DLGPROC,
-    DWLP_MSGRESULT, HMENU, SWP_NOMOVE, SWP_NOZORDER, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX,
-    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_INITDIALOG,
-    WM_SETFONT, WS_CHILD, WS_GROUP, WS_VISIBLE,
+    CreateWindowExW, DialogBoxParamW, EndDialog, GetClientRect, GetWindowRect, SetWindowPos,
+    SetWindowTextW, BS_PUSHBUTTON, DLGPROC, HMENU, SWP_NOMOVE, SWP_NOZORDER, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_ERASEBKGND, WM_INITDIALOG, WM_PAINT, WS_CHILD,
+    WS_VISIBLE,
 };
 
 const IDD_DETAIL: u32 = 101;
-/// 起始控件 ID：每行两个静态文本（键、值），所以步长是 2。
-const IDC_DETAIL_ROW: u32 = 4000;
-/// 状态行的值控件 ID（第 1 行的值），用于上语义色。
-const IDC_STATUS_VALUE: u32 = IDC_DETAIL_ROW + 3;
+/// 「状态」在 build_rows 里的行号，自绘时给这一行的值上胶囊。
+const STATUS_ROW: usize = 1;
 
-const ROW_H: i32 = 26;
-const FIRST_Y: i32 = 16;
-const KEY_X: i32 = 16;
-const KEY_W: i32 = 100;
-const VAL_X: i32 = KEY_X + KEY_W + 12;
-const VAL_W: i32 = 340;
-const RIGHT_PAD: i32 = 16;
+const PAD_X: i32 = 20;
+const LABEL_W: i32 = 110;
+const LABEL_GAP: i32 = 16;
+const VAL_X: i32 = PAD_X + LABEL_W + LABEL_GAP;
+const CLIENT_W: i32 = 520;
+const VAL_W: i32 = CLIENT_W - VAL_X - PAD_X;
+const ROW_H: i32 = 30;
+const FIRST_Y: i32 = 12;
+const BUTTON_GAP: i32 = 14;
+const BUTTON_H: i32 = 28;
+const BUTTON_W: i32 = 88;
 const BOTTOM_PAD: i32 = 16;
-const BUTTON_GAP: i32 = 12;
-const BUTTON_H: i32 = 26;
-const BUTTON_W: i32 = 80;
 
 type Rows = Vec<(&'static str, String)>;
-type Content = (String, Rows, COLORREF);
+/// (标题, 行, 状态前景色, 状态胶囊底色)
+type Content = (String, Rows, COLORREF, COLORREF);
 
 thread_local! {
     static CONTENT: RefCell<Content> =
-        const { RefCell::new((String::new(), Vec::new(), COLORREF(0))) };
+        const { RefCell::new((String::new(), Vec::new(), COLORREF(0), COLORREF(0))) };
 }
 
 pub fn build_rows(n: &Nic) -> Vec<(&'static str, String)> {
@@ -96,12 +97,13 @@ fn status_line(n: &Nic) -> String {
 /// 弹出模态详情对话框。`parent` 是主对话框。
 pub fn show(parent: HWND, n: &Nic) {
     // 模板里没有名称行，标题栏带上 alias，否则用户分不清看的是哪张卡。
-    let status_fg = theme::status_colors(n.enabled, n.connected).0;
+    let (fg, pill_bg) = theme::status_colors(n.enabled, n.connected);
     CONTENT.with(|c| {
         *c.borrow_mut() = (
             format!("网卡详细信息 - {}", n.alias),
             build_rows(n),
-            status_fg,
+            fg,
+            pill_bg,
         )
     });
     unsafe {
@@ -119,54 +121,23 @@ pub fn show(parent: HWND, n: &Nic) {
     }
 }
 
-unsafe extern "system" fn dlgproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
+unsafe extern "system" fn dlgproc(hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPARAM) -> isize {
     match msg {
         WM_INITDIALOG => {
             crate::ui::set_title_icons(hwnd);
-            let (title, rows, _) = CONTENT.with(|c| c.borrow().clone());
+            let (title, rows, _, _) = CONTENT.with(|c| c.borrow().clone());
             let t = wide(&title);
             let _ = SetWindowTextW(hwnd, PCWSTR(t.as_ptr()));
-            for (i, (key, value)) in rows.iter().enumerate() {
-                let y = FIRST_Y + i as i32 * ROW_H;
-                make_static(hwnd, KEY_X, y, KEY_W, key, IDC_DETAIL_ROW + i as u32 * 2);
-                make_static(
-                    hwnd,
-                    VAL_X,
-                    y,
-                    VAL_W,
-                    value,
-                    IDC_DETAIL_ROW + i as u32 * 2 + 1,
-                );
-            }
-            let client_w = VAL_X + VAL_W + RIGHT_PAD;
             let btn_y = FIRST_Y + rows.len() as i32 * ROW_H + BUTTON_GAP;
-            make_button(hwnd, client_w - RIGHT_PAD - BUTTON_W, btn_y, "关闭", 2);
+            make_button(hwnd, CLIENT_W - PAD_X - BUTTON_W, btn_y, "关闭", 2);
             resize_to_rows(hwnd, rows.len());
             1
         }
-        WM_CTLCOLORDLG => {
-            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
-            SetBkColor(hdc, theme::BG);
-            set_msg_result(hwnd, white_brush().0 as isize);
-            1
-        }
-        WM_CTLCOLORSTATIC => {
-            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
-            let child = HWND(lparam.0 as *mut core::ffi::c_void);
-            let id = GetDlgCtrlID(child) as u32;
-            let status_fg = CONTENT.with(|c| c.borrow().2);
-            let off = id.wrapping_sub(IDC_DETAIL_ROW);
-            let color = if id == IDC_STATUS_VALUE {
-                status_fg
-            } else if off.is_multiple_of(2) {
-                theme::TEXT_DIM
-            } else {
-                theme::TEXT
-            };
-            SetBkColor(hdc, theme::BG);
-            SetTextColor(hdc, color);
-            set_msg_result(hwnd, white_brush().0 as isize);
-            1
+        // 自己整块画白底，跳过默认灰底擦除，避免闪灰。
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            paint(hwnd);
+            0
         }
         WM_COMMAND => {
             // 1=IDOK、2=IDCANCEL：回车 / Esc / 关闭按钮都走这里。
@@ -185,13 +156,78 @@ unsafe extern "system" fn dlgproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
-/// 对话框过程的返回值只是 BOOL；WM_CTLCOLOR* 要返回的画刷必须写进 DWLP_MSGRESULT。
-unsafe fn set_msg_result(hwnd: HWND, value: isize) {
-    SetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(DWLP_MSGRESULT as i32), value);
+/// 整块自绘：白底 + 隔行浅灰 + 左标签右值 + 状态胶囊。
+unsafe fn paint(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    if hdc.0.is_null() {
+        return;
+    }
+    let mut cr = RECT::default();
+    let _ = GetClientRect(hwnd, &mut cr);
+
+    let base = CreateSolidBrush(theme::BG);
+    FillRect(hdc, &cr, base);
+    let _ = DeleteObject(HGDIOBJ(base.0));
+
+    let (_, rows, fg, pill_bg) = CONTENT.with(|c| c.borrow().clone());
+    let old_font = SelectObject(hdc, HGDIOBJ(crate::ui::ui_font().0));
+    SetBkMode(hdc, TRANSPARENT);
+
+    for (i, (key, value)) in rows.iter().enumerate() {
+        let top = FIRST_Y + i as i32 * ROW_H;
+        let bg = theme::row_bg(false, i);
+        let band = RECT {
+            left: 0,
+            top,
+            right: cr.right,
+            bottom: top + ROW_H,
+        };
+        let brush = CreateSolidBrush(bg);
+        FillRect(hdc, &band, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+
+        SetTextColor(hdc, theme::TEXT_DIM);
+        let mut lr = RECT {
+            left: PAD_X,
+            top,
+            right: PAD_X + LABEL_W,
+            bottom: top + ROW_H,
+        };
+        draw_line(hdc, key, &mut lr);
+
+        if i == STATUS_ROW {
+            let cell = RECT {
+                left: VAL_X - 6,
+                top,
+                right: VAL_X + VAL_W,
+                bottom: top + ROW_H,
+            };
+            crate::ui::draw_status_pill(hdc, &cell, bg, fg, pill_bg, value);
+        } else {
+            SetTextColor(hdc, theme::TEXT);
+            let mut vr = RECT {
+                left: VAL_X,
+                top,
+                right: VAL_X + VAL_W,
+                bottom: top + ROW_H,
+            };
+            draw_line(hdc, value, &mut vr);
+        }
+    }
+
+    SelectObject(hdc, old_font);
+    let _ = EndPaint(hwnd, &ps);
 }
 
-fn white_brush() -> HBRUSH {
-    unsafe { HBRUSH(GetStockObject(WHITE_BRUSH).0) }
+unsafe fn draw_line(hdc: HDC, text: &str, r: &mut RECT) {
+    let mut buf: Vec<u16> = text.encode_utf16().collect();
+    DrawTextW(
+        hdc,
+        &mut buf,
+        r,
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
 }
 
 /// 客户区期望尺寸 + 实测非客户区（标题栏/边框，随 DPI 与主题变化），不再猜固定像素。
@@ -203,86 +239,39 @@ unsafe fn resize_to_rows(hwnd: HWND, rows: usize) {
     }
     let nc_w = (wr.right - wr.left) - (cr.right - cr.left);
     let nc_h = (wr.bottom - wr.top) - (cr.bottom - cr.top);
-    let client_w = VAL_X + VAL_W + RIGHT_PAD;
     let client_h = FIRST_Y + rows as i32 * ROW_H + BUTTON_GAP + BUTTON_H + BOTTOM_PAD;
     let _ = SetWindowPos(
         hwnd,
         None,
         wr.left,
         wr.top,
-        client_w + nc_w,
+        CLIENT_W + nc_w,
         client_h + nc_h,
         SWP_NOZORDER | SWP_NOMOVE,
     );
 }
 
-unsafe fn create_child(
-    parent: HWND,
-    class: &str,
-    style: WINDOW_STYLE,
-    bounds: RECT,
-    text: &str,
-    id: u32,
-) {
+unsafe fn make_button(parent: HWND, x: i32, y: i32, text: &str, id: u32) {
     let t = wide(text);
-    let cls = wide(class);
+    let cls = wide("BUTTON");
     let Ok(hmodule) = GetModuleHandleW(None) else {
         return;
     };
-    let Ok(child) = CreateWindowExW(
+    // 按钮不单独设字体：继承对话框默认 chrome 字体，与主窗口按钮保持一致；
+    // 正文（自绘行）才用 ui_font，形成「正文 17 / chrome 默认」两级统一字阶。
+    let _ = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         PCWSTR(cls.as_ptr()),
         PCWSTR(t.as_ptr()),
-        style,
-        bounds.left,
-        bounds.top,
-        bounds.right - bounds.left,
-        bounds.bottom - bounds.top,
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        x,
+        y,
+        BUTTON_W,
+        BUTTON_H,
         Some(parent),
         Some(HMENU(id as *mut core::ffi::c_void)),
         Some(HINSTANCE(hmodule.0)),
         None,
-    ) else {
-        return;
-    };
-    // 手建的控件不继承对话框模板字体，统一用主列表同款 Segoe UI。
-    SendMessageW(
-        child,
-        WM_SETFONT,
-        Some(WPARAM(crate::ui::ui_font().0 as usize)),
-        Some(LPARAM(1)),
-    );
-}
-
-unsafe fn make_static(parent: HWND, x: i32, y: i32, w: i32, text: &str, id: u32) {
-    create_child(
-        parent,
-        "STATIC",
-        WS_CHILD | WS_VISIBLE | WS_GROUP,
-        RECT {
-            left: x,
-            top: y,
-            right: x + w,
-            bottom: y + ROW_H,
-        },
-        text,
-        id,
-    );
-}
-
-unsafe fn make_button(parent: HWND, x: i32, y: i32, text: &str, id: u32) {
-    create_child(
-        parent,
-        "BUTTON",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        RECT {
-            left: x,
-            top: y,
-            right: x + BUTTON_W,
-            bottom: y + BUTTON_H,
-        },
-        text,
-        id,
     );
 }
 
@@ -356,11 +345,19 @@ mod tests {
         assert!(rows.iter().all(|(_, v)| !v.is_empty() && !v.contains('\n')));
     }
 
-    /// 状态值控件 ID 必须落在第 1 行的「值」上，否则语义色会染错行。
+    /// 胶囊必须落在「状态」行，否则语义色会染错行。
     #[test]
-    fn status_value_id_is_row1_value() {
-        let row: u32 = 1;
-        assert_eq!(IDC_STATUS_VALUE, IDC_DETAIL_ROW + row * 2 + 1);
+    fn status_row_index_matches_status_key() {
+        assert_eq!(build_rows(&sample())[STATUS_ROW].0, "状态");
+    }
+
+    /// 值列必须放得下最宽的标签且不越出右留白（编译期布局不变量）。
+    #[test]
+    fn value_column_stays_inside_client() {
+        const {
+            assert!(VAL_X > PAD_X + LABEL_W);
+            assert!(VAL_X + VAL_W + PAD_X == CLIENT_W);
+        }
     }
 
     fn sample() -> crate::netinfo::Nic {

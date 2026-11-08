@@ -35,8 +35,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, TrackPopupMenu, DWLP_MSGRESULT, ICON_BIG, ICON_SMALL, IDYES, IMAGE_ICON,
     LR_SHARED, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT, MF_GRAYED,
     MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, TPM_LEFTALIGN, TPM_TOPALIGN,
-    WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_INITDIALOG, WM_NOTIFY,
-    WM_SETFONT, WM_SETICON, WM_SIZE, WM_SYSCOMMAND,
+    WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_ERASEBKGND, WM_INITDIALOG,
+    WM_NOTIFY, WM_SETFONT, WM_SETICON, WM_SIZE, WM_SYSCOMMAND,
 };
 
 pub const IDD_MAIN: u32 = 100;
@@ -553,7 +553,7 @@ fn trim_working_set() {
 ///
 /// # Safety
 /// `hdc` 必须是 custom-draw 通知里有效的设备上下文；`cell` 是该格矩形。
-unsafe fn draw_status_pill(
+pub unsafe fn draw_status_pill(
     hdc: HDC,
     cell: &RECT,
     row_bg: COLORREF,
@@ -773,6 +773,17 @@ pub unsafe extern "system" fn main_dlgproc(
             refresh_list(hwnd);
             layout(hwnd);
             sync_buttons(hwnd, list_view(hwnd));
+            1
+        }
+        // 主窗口与详情统一白底：直接在擦除阶段填白（WM_CTLCOLORDLG 在对话框过程里被忽略过）。
+        WM_ERASEBKGND => {
+            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+            let mut rc = RECT::default();
+            if GetClientRect(hwnd, &mut rc).is_ok() {
+                let brush = CreateSolidBrush(theme::BG);
+                FillRect(hdc, &rc, brush);
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+            }
             1
         }
         WM_COMMAND => {
