@@ -224,6 +224,39 @@ pub fn renew_dhcp_args(if_index: u32) -> Vec<String> {
     ))
 }
 
+/// 重置网络的三步。前两步是 netsh（会改 Winsock/协议栈），第三步清 DNS 缓存。
+pub fn reset_commands() -> Vec<Vec<String>> {
+    vec![
+        vec!["winsock".into(), "reset".into()],
+        vec!["int".into(), "ip".into(), "reset".into()],
+        ps_args("Clear-DnsClientCache"),
+    ]
+}
+
+/// 依次执行；失败立即停，已成功的步骤不回滚（回滚本身会再次改动网络栈）。
+pub fn reset_network() -> Result<(), String> {
+    let cmds = reset_commands();
+    for (i, args) in cmds.iter().enumerate() {
+        let r = if i == 2 {
+            run_netadapter(args)
+        } else {
+            run_netsh(args)
+        };
+        if let Err(e) = r {
+            return Err(format!("第 {} 步失败：{e}", i + 1));
+        }
+    }
+    Ok(())
+}
+
+pub fn flush_dns_args() -> Vec<String> {
+    ps_args("Clear-DnsClientCache")
+}
+
+pub fn flush_dns() -> Result<(), String> {
+    run_netadapter(&flush_dns_args())
+}
+
 #[derive(Clone)]
 pub struct IpConfig {
     pub if_index: u32,
@@ -424,6 +457,25 @@ mod tests {
             failure_text("netsh", Some(1), b"\n \n", b""),
             "netsh 退出码 1"
         );
+    }
+
+    #[test]
+    fn reset_runs_three_steps_in_order() {
+        let cmds = reset_commands();
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0], vec!["winsock".to_string(), "reset".to_string()]);
+        assert_eq!(
+            cmds[1],
+            vec!["int".to_string(), "ip".to_string(), "reset".to_string()]
+        );
+        assert!(cmds[2][3].contains("Clear-DnsClientCache"));
+    }
+
+    /// 阶段1 的工具条按钮「刷新 DNS 缓存」一直没接线，本任务补上。
+    #[test]
+    fn flush_dns_args_clear_cache() {
+        let a = flush_dns_args();
+        assert!(a[3].ends_with("Clear-DnsClientCache"), "{}", a[3]);
     }
 
     #[test]

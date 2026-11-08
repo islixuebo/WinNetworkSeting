@@ -887,6 +887,49 @@ pub unsafe fn on_dhcp_action(hwnd: HWND, renew: bool) {
     }
 }
 
+pub fn reset_warning() -> &'static str {
+    "将重置 Winsock 与 TCP/IP 协议栈，并清空 DNS 缓存。\n\n\
+     这会删除所有网络适配器上的自定义设置（静态 IP、DNS、路由），\
+     且 Winsock 重置需要重启电脑才完全生效。\n\n确定继续？"
+}
+
+/// 「重置网络」：破坏性操作，必须二次确认。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn on_reset(hwnd: HWND) {
+    let body = wide(reset_warning());
+    let title = wide("重置网络");
+    if MessageBoxW(
+        Some(hwnd),
+        PCWSTR(body.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        MB_YESNO | MB_ICONWARNING,
+    ) != IDYES
+    {
+        return;
+    }
+    match netctl::reset_network() {
+        Ok(()) => {
+            set_status(hwnd, "网络已重置，请重启电脑使 Winsock 重置完全生效");
+            refresh_list(hwnd);
+            sync_buttons(hwnd, list_view(hwnd));
+        }
+        Err(e) => set_status(hwnd, &format!("重置网络失败：{e}")),
+    }
+}
+
+/// 「刷新 DNS 缓存」：步骤无破坏性、可重复执行，不做二次确认。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn on_flush_dns(hwnd: HWND) {
+    match netctl::flush_dns() {
+        Ok(()) => set_status(hwnd, "DNS 缓存已刷新"),
+        Err(e) => set_status(hwnd, &format!("刷新 DNS 缓存失败：{e}")),
+    }
+}
+
 /// 在光标处弹出启用/禁用菜单。不带 TPM_RETURNCMD：选中项由系统以 WM_COMMAND
 /// 投给 owner 对话框，与按钮走同一条分发路径。
 ///
@@ -1441,8 +1484,9 @@ pub unsafe extern "system" fn main_dlgproc(
                 IDM_RENAME => on_rename(hwnd),
                 IDM_RELEASE => on_dhcp_action(hwnd, false),
                 IDM_RENEW => on_dhcp_action(hwnd, true),
+                IDC_FLUSH_DNS => on_flush_dns(hwnd),
+                IDC_RESET => on_reset(hwnd),
                 IDC_ROUTE_REFRESH => refresh_routes(hwnd),
-                // 刷新 DNS 缓存由阶段2 接线
                 _ => return 0,
             }
             1
@@ -1580,6 +1624,12 @@ mod tests {
             NicKind::Wireless,
             "WLAN"
         )));
+    }
+
+    /// 重置网络的告警必须说清「要重启」—— 不说清的提示等于没提示。
+    #[test]
+    fn reset_warning_mentions_reboot() {
+        assert!(reset_warning().contains("重启"));
     }
 
     /// 改 IP 的断网告警只在默认路由网卡上出现，否则每次点「确定」都白弹一次。
