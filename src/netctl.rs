@@ -3,6 +3,7 @@
 // 列表里的 5 条有 4 条（WLAN 2/4/5、蓝牙网络连接）按名字点不到，故补一条按 ifIndex 的 CIM 回退。
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
+use windows::Win32::Globalization::{GetOEMCP, MultiByteToWideChar, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
 
 /// netsh/powershell 都是控制台程序：GUI 进程没有控制台，CreateProcess 会给子进程
 /// 新建一个控制台窗口，界面上就是「点启用/禁用闪一下黑窗」。CREATE_NO_WINDOW 让它
@@ -298,6 +299,115 @@ pub fn apply_ip_config(cfg: &IpConfig) -> Result<(), String> {
     run_netadapter(&set_dns_args(cfg.if_index, &cfg.dns))
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TestKind {
+    Ping,
+    Tracert,
+    Nslookup,
+    IpConfig,
+}
+
+pub fn test_kind_name(kind: TestKind) -> &'static str {
+    match kind {
+        TestKind::Ping => "Ping",
+        TestKind::Tracert => "Tracert",
+        TestKind::Nslookup => "Nslookup",
+        TestKind::IpConfig => "Ipconfig /all",
+    }
+}
+
+/// 全部用系统自带的控制台工具：没有 PowerShell 启动开销，输出也是用户熟悉的样子。
+pub fn test_program(kind: TestKind) -> &'static str {
+    match kind {
+        TestKind::Ping => "ping",
+        TestKind::Tracert => "tracert",
+        TestKind::Nslookup => "nslookup",
+        TestKind::IpConfig => "ipconfig",
+    }
+}
+
+pub fn test_args(kind: TestKind, target: &str) -> Vec<String> {
+    match kind {
+        TestKind::Ping => vec!["-n".into(), "4".into(), target.into()],
+        TestKind::Tracert => vec![
+            "-h".into(),
+            "30".into(),
+            "-w".into(),
+            "500".into(),
+            target.into(),
+        ],
+        TestKind::Nslookup => vec![target.into()],
+        TestKind::IpConfig => vec!["/all".into()],
+    }
+}
+
+/// 控制台工具按 OEM 码页输出字节；`codepage` 显式传入，便于用固定码页做单测。
+pub fn decode_codepage(codepage: u32, bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let mut buf = vec![0u16; bytes.len() + 1];
+    let n = unsafe {
+        MultiByteToWideChar(
+            codepage,
+            MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0),
+            bytes,
+            Some(&mut buf),
+        )
+    };
+    if n <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..n as usize])
+}
+
+pub fn decode_oem(bytes: &[u8]) -> String {
+    decode_codepage(unsafe { GetOEMCP() }, bytes)
+}
+
+/// 测试输出：解码后的全文 + 退出码。退出码非零不等于失败（ping 不通就是 1），
+/// 所以 UI 必须把输出原样显示，不能只显示一句「失败」。
+pub struct TestResult {
+    pub text: String,
+    pub code: Option<i32>,
+}
+
+impl TestResult {
+    pub fn summary(&self) -> String {
+        match self.code {
+            Some(0) => "完成".to_string(),
+            Some(c) => format!("结束（退出码 {c}）"),
+            None => "结束（未取到退出码）".to_string(),
+        }
+    }
+}
+
+pub fn run_test(kind: TestKind, target: &str) -> TestResult {
+    let out = Command::new(test_program(kind))
+        .args(test_args(kind, target))
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match out {
+        Ok(o) => {
+            let mut text = decode_oem(&o.stdout);
+            let err = decode_oem(&o.stderr);
+            if !err.trim().is_empty() {
+                text.push_str(&err);
+            }
+            TestResult {
+                text,
+                code: o.status.code(),
+            }
+        }
+        Err(e) => TestResult {
+            text: format!("启动 {} 失败：{e}", test_program(kind)),
+            code: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +636,47 @@ mod tests {
             failure_text("netsh", None, b"", b"").contains("未取到退出码"),
             "两条线索都丢了也必须留一句能看懂的话"
         );
+    }
+
+    #[test]
+    fn test_command_shapes() {
+        assert_eq!(test_program(TestKind::Ping), "ping");
+        assert_eq!(test_args(TestKind::Ping, "10.0.0.1"), vec!["-n", "4", "10.0.0.1"]);
+        assert_eq!(test_args(TestKind::Tracert, "10.0.0.1"), vec!["-h", "30", "-w", "500", "10.0.0.1"]);
+        assert_eq!(test_args(TestKind::Nslookup, "example.com"), vec!["example.com"]);
+        // ipconfig 不吃目标参数
+        assert_eq!(test_args(TestKind::IpConfig, "ignored"), vec!["/all"]);
+        assert_eq!(test_kind_name(TestKind::Ping), "Ping");
+    }
+
+    /// 中文 Windows 的控制台工具输出是 GBK。按 OEM 码页解码，
+    /// 按 UTF-8 硬解会得到替换符 —— 这条测试钉的是「按码页解」这件事本身。
+    #[test]
+    fn oem_decode_keeps_chinese_output() {
+        // 「无法访问目标主机.」的 GBK 字节
+        let gbk = [
+            0xce, 0xde, 0xb7, 0xa8, 0xb7, 0xc3, 0xce, 0xca, 0xc4, 0xbf, 0xb1, 0xea, 0xd6, 0xf7,
+            0xbb, 0xfa, 0x2e,
+        ];
+        assert_eq!(decode_codepage(936, &gbk), "无法访问目标主机.");
+        // 「请求超时.」
+        let gbk2 = [0xc7, 0xeb, 0xc7, 0xf3, 0xb3, 0xac, 0xca, 0xb1, 0x2e];
+        assert_eq!(decode_codepage(936, &gbk2), "请求超时.");
+        // 空输入不 panic，返回空串
+        assert_eq!(decode_codepage(936, &[]), "");
+    }
+
+    #[test]
+    fn test_result_carries_exit_code_even_without_output() {
+        let r = TestResult { text: String::new(), code: Some(1) };
+        assert_eq!(r.summary(), "结束（退出码 1）");
+    }
+
+    #[test]
+    #[ignore]
+    fn real_ping_loopback_works() {
+        let r = run_test(TestKind::Ping, "127.0.0.1");
+        assert_eq!(r.code, Some(0), "{}", r.text);
+        assert!(r.text.contains("127.0.0.1"));
     }
 }
