@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, FillRect, GetSysColorBrush, SetBkMode, SetTextColor, COLOR_WINDOW,
-    HGDIOBJ, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, FillRect, GetSysColorBrush, SetBkMode, SetTextColor,
+    COLOR_WINDOW, HGDIOBJ, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
@@ -429,7 +429,14 @@ unsafe fn build_cfg_controls(hwnd: HWND, cfg: &NicConfigEdit) {
     add_label(hwnd, 24, g2_y + 86, 48, "网关");
     add_edit(hwnd, edit_x, g2_y + 82, 140, &cfg.ip.gw, CFG_GW);
     add_label(hwnd, 24, g2_y + 116, 48, "DNS");
-    add_edit(hwnd, edit_x, g2_y + 112, edit_w, &cfg.ip.dns.join(","), CFG_DNS);
+    add_edit(
+        hwnd,
+        edit_x,
+        g2_y + 112,
+        edit_w,
+        &cfg.ip.dns.join(","),
+        CFG_DNS,
+    );
     enable_ip_fields(hwnd, !cfg.ip.use_dhcp);
 
     add_button(hwnd, cx - margin - 68 - 8 - 68, buttons_y, 68, "确定", 1);
@@ -591,7 +598,11 @@ pub struct RouteDraft {
 }
 
 /// 路由表单校验；ifIndex 由对话框按下拉选择覆盖（抽出来便于单测）。
-pub fn parse_route_fields(prefix: &str, next_hop: &str, metric: &str) -> Result<RouteDraft, String> {
+pub fn parse_route_fields(
+    prefix: &str,
+    next_hop: &str,
+    metric: &str,
+) -> Result<RouteDraft, String> {
     let prefix = crate::validate::route_prefix(prefix)?;
     let hop = crate::validate::parse_ipv4(next_hop)
         .ok_or_else(|| "下一跳不是合法的 IPv4 地址".to_string())?;
@@ -647,11 +658,7 @@ unsafe fn add_combo(parent: HWND, x: i32, y: i32, w: i32, h: i32, id: u32) -> HW
         parent,
         "COMBOBOX",
         "",
-        WS_CHILD
-            | WS_VISIBLE
-            | WS_TABSTOP
-            | WS_VSCROLL
-            | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
         x,
         y,
         w,
@@ -674,13 +681,8 @@ unsafe fn build_route_controls(hwnd: HWND) {
     let entries = ROUTE.with(|r| r.borrow().0.clone());
     for (label, if_index) in entries.iter() {
         let t = wide(label);
-        let idx = SendMessageW(
-            combo,
-            CB_ADDSTRING,
-            None,
-            Some(LPARAM(t.as_ptr() as isize)),
-        )
-        .0 as i32;
+        let idx =
+            SendMessageW(combo, CB_ADDSTRING, None, Some(LPARAM(t.as_ptr() as isize))).0 as i32;
         if idx >= 0 {
             SendMessageW(
                 combo,
@@ -691,12 +693,7 @@ unsafe fn build_route_controls(hwnd: HWND) {
         }
     }
     if !entries.is_empty() {
-        SendMessageW(
-            combo,
-            CB_SETCURSEL,
-            Some(WPARAM(0)),
-            None,
-        );
+        SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), None);
     }
 
     add_label(hwnd, margin, 56, 64, "目标前缀");
@@ -719,13 +716,7 @@ unsafe fn accept_route(hwnd: HWND) -> isize {
         errors.push("请选择接口".to_string());
         0
     } else {
-        SendMessageW(
-            combo,
-            CB_GETITEMDATA,
-            Some(WPARAM(sel as usize)),
-            None,
-        )
-        .0 as u32
+        SendMessageW(combo, CB_GETITEMDATA, Some(WPARAM(sel as usize)), None).0 as u32
     };
     let mut draft = match parse_route_fields(
         &read_edit(hwnd, ROUTE_PREFIX),
@@ -797,10 +788,24 @@ mod tests {
         assert_eq!(d.next_hop, "10.20.0.1");
         assert_eq!(d.metric, 50);
         // 默认路由也是合法输入（删除侧才做断网告警）
-        assert_eq!(parse_route_fields("0.0.0.0/0", "10.0.0.1", "0").unwrap().prefix, "0.0.0.0/0");
-        assert!(parse_route_fields("10.20.0.0", "10.20.0.1", "5").is_err(), "缺前缀长度");
-        assert!(parse_route_fields("10.20.0.0/24", "no", "5").is_err(), "下一跳非法");
-        assert!(parse_route_fields("10.20.0.0/24", "10.20.0.1", "x").is_err(), "跃点非数字");
+        assert_eq!(
+            parse_route_fields("0.0.0.0/0", "10.0.0.1", "0")
+                .unwrap()
+                .prefix,
+            "0.0.0.0/0"
+        );
+        assert!(
+            parse_route_fields("10.20.0.0", "10.20.0.1", "5").is_err(),
+            "缺前缀长度"
+        );
+        assert!(
+            parse_route_fields("10.20.0.0/24", "no", "5").is_err(),
+            "下一跳非法"
+        );
+        assert!(
+            parse_route_fields("10.20.0.0/24", "10.20.0.1", "x").is_err(),
+            "跃点非数字"
+        );
     }
 
     #[test]
@@ -810,6 +815,9 @@ mod tests {
         assert_eq!(parse_metric_field(" 1 ", false), Ok(Some(1)));
         assert!(parse_metric_field("0", false).is_err(), "跃点 0 由系统保留");
         assert!(parse_metric_field("abc", false).is_err());
-        assert!(parse_metric_field("999999999", false).is_err(), "超出 u32 要报错");
+        assert!(
+            parse_metric_field("999999999", false).is_err(),
+            "超出 u32 要报错"
+        );
     }
 }

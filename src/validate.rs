@@ -4,7 +4,10 @@ use std::net::Ipv4Addr;
 pub fn parse_ipv4(s: &str) -> Option<Ipv4Addr> {
     // std 的解析允许前导零等宽松写法，这里额外要求每段都是十进制数字，避免 "0x10.1.1.1"
     let t = s.trim();
-    if t.is_empty() || !t.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    if t.is_empty()
+        || !t
+            .split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
     {
         return None;
     }
@@ -101,7 +104,14 @@ mod tests {
             parse_ipv4(" 10.0.0.2 ").map(|a| a.to_string()).as_deref(),
             Some("10.0.0.2")
         );
-        for bad in ["", "192.168.1", "192.168.1.256", "1.2.3.4.5", "abc", "1.2.3.-4"] {
+        for bad in [
+            "",
+            "192.168.1",
+            "192.168.1.256",
+            "1.2.3.4.5",
+            "abc",
+            "1.2.3.-4",
+        ] {
             assert!(parse_ipv4(bad).is_none(), "不该接受 {bad:?}");
         }
     }
@@ -141,7 +151,10 @@ mod tests {
         assert_eq!(dns_servers("").as_deref(), Ok(&[][..]), "空串 = 清空 DNS");
         assert!(dns_servers("1.1.1.1, nope").is_err());
         // 最多两个备用服务器是 Windows 界面的通行值，多了不拦，但要能全量下发
-        assert_eq!(dns_servers("1.1.1.1,8.8.8.8,9.9.9.9").map(|v| v.len()), Ok(3));
+        assert_eq!(
+            dns_servers("1.1.1.1,8.8.8.8,9.9.9.9").map(|v| v.len()),
+            Ok(3)
+        );
     }
 
     #[test]

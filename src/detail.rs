@@ -69,10 +69,7 @@ pub fn build_rows(n: &Nic) -> Vec<(&'static str, String)> {
         ("DNS", dash(&n.dns.join(", "))),
         ("MAC", dash(&n.mac)),
         ("速率", dash(&n.speed)),
-        (
-            "接口跃点数",
-            metric_display(n.metric, n.metric_auto),
-        ),
+        ("接口跃点数", metric_display(n.metric, n.metric_auto)),
         (
             "默认路由",
             if n.is_default_route { "是" } else { "否" }.to_string(),

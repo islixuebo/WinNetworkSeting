@@ -480,7 +480,9 @@ mod tests {
     fn auto_metric_args_only_touch_automatic_flag() {
         let a = set_metric_auto_args(19);
         assert!(
-            a[3].ends_with("Set-NetIPInterface -InterfaceIndex 19 -AutomaticMetric Enabled -Confirm:$False"),
+            a[3].ends_with(
+                "Set-NetIPInterface -InterfaceIndex 19 -AutomaticMetric Enabled -Confirm:$False"
+            ),
             "{}",
             a[3]
         );
@@ -530,7 +532,9 @@ mod tests {
     fn dns_command_sends_all_servers_or_resets() {
         let two = set_dns_args(19, &["1.1.1.1".into(), "8.8.8.8".into()]);
         assert!(
-            two[3].ends_with("Set-DnsClientServerAddress -InterfaceIndex 19 -ServerAddresses 1.1.1.1,8.8.8.8"),
+            two[3].ends_with(
+                "Set-DnsClientServerAddress -InterfaceIndex 19 -ServerAddresses 1.1.1.1,8.8.8.8"
+            ),
             "{}",
             two[3]
         );
@@ -641,9 +645,18 @@ mod tests {
     #[test]
     fn test_command_shapes() {
         assert_eq!(test_program(TestKind::Ping), "ping");
-        assert_eq!(test_args(TestKind::Ping, "10.0.0.1"), vec!["-n", "4", "10.0.0.1"]);
-        assert_eq!(test_args(TestKind::Tracert, "10.0.0.1"), vec!["-h", "30", "-w", "500", "10.0.0.1"]);
-        assert_eq!(test_args(TestKind::Nslookup, "example.com"), vec!["example.com"]);
+        assert_eq!(
+            test_args(TestKind::Ping, "10.0.0.1"),
+            vec!["-n", "4", "10.0.0.1"]
+        );
+        assert_eq!(
+            test_args(TestKind::Tracert, "10.0.0.1"),
+            vec!["-h", "30", "-w", "500", "10.0.0.1"]
+        );
+        assert_eq!(
+            test_args(TestKind::Nslookup, "example.com"),
+            vec!["example.com"]
+        );
         // ipconfig 不吃目标参数
         assert_eq!(test_args(TestKind::IpConfig, "ignored"), vec!["/all"]);
         assert_eq!(test_kind_name(TestKind::Ping), "Ping");
@@ -668,7 +681,10 @@ mod tests {
 
     #[test]
     fn test_result_carries_exit_code_even_without_output() {
-        let r = TestResult { text: String::new(), code: Some(1) };
+        let r = TestResult {
+            text: String::new(),
+            code: Some(1),
+        };
         assert_eq!(r.summary(), "结束（退出码 1）");
     }
 

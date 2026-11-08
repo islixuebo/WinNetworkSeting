@@ -34,11 +34,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, GetDlgItem,
     GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadImageW, MessageBoxW, MoveWindow,
-    PostMessageW, SendMessageW, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, CB_ADDSTRING,
-    CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE, DWLP_MSGRESULT, ICON_BIG, ICON_SMALL, IDYES,
+    PostMessageW, SendMessageW, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, CBN_SELCHANGE,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, DWLP_MSGRESULT, ICON_BIG, ICON_SMALL, IDYES,
     IMAGE_ICON, LR_SHARED, MB_ICONERROR, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
-    MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, SW_HIDE,
-    SW_SHOW, TPM_LEFTALIGN, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_APP, WM_CLOSE, WM_COMMAND,
+    MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_SHOW,
+    TPM_LEFTALIGN, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_APP, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_NOTIFY, WM_SETFONT, WM_SETICON,
     WM_SIZE, WM_SYSCOMMAND,
 };
@@ -954,7 +954,9 @@ pub fn valid_target(kind: TestKind, target: &str) -> Result<(), String> {
     if t.len() > 255 {
         return Err("目标过长".into());
     }
-    if t.chars().any(|c| c.is_whitespace() || "&|;<>\"'".contains(c)) {
+    if t.chars()
+        .any(|c| c.is_whitespace() || "&|;<>\"'".contains(c))
+    {
         return Err("目标不能包含空格或特殊字符".into());
     }
     Ok(())
@@ -1061,7 +1063,11 @@ unsafe fn init_test_kind(hwnd: HWND) {
 /// # Safety
 /// `hwnd` 是主对话框。
 pub unsafe fn on_test_kind_changed(hwnd: HWND) {
-    set_control_enabled(hwnd, IDC_TEST_TARGET, current_test_kind(hwnd) != TestKind::IpConfig);
+    set_control_enabled(
+        hwnd,
+        IDC_TEST_TARGET,
+        current_test_kind(hwnd) != TestKind::IpConfig,
+    );
 }
 
 /// 删除默认路由前的断网告警；其它路由返回空串。
@@ -2341,7 +2347,10 @@ mod tests {
     fn target_validation_requires_input_except_for_ipconfig() {
         assert!(valid_target(TestKind::Ping, "10.0.0.1").is_ok());
         assert!(valid_target(TestKind::Ping, "  ").is_err());
-        assert!(valid_target(TestKind::Ping, "10.0.0.1 & del x").is_err(), "不许带 shell 元字符");
+        assert!(
+            valid_target(TestKind::Ping, "10.0.0.1 & del x").is_err(),
+            "不许带 shell 元字符"
+        );
         assert!(valid_target(TestKind::Nslookup, "example.com").is_ok());
         assert!(valid_target(TestKind::IpConfig, "").is_ok());
     }
@@ -2356,7 +2365,10 @@ mod tests {
     /// 报告头必须包含命令与结果摘要，否则用户不知道这段输出来自哪次测试。
     #[test]
     fn report_header_has_kind_target_and_summary() {
-        let r = TestResult { text: "Pinging 10.0.0.1".into(), code: Some(0) };
+        let r = TestResult {
+            text: "Pinging 10.0.0.1".into(),
+            code: Some(0),
+        };
         let s = test_report(TestKind::Ping, "10.0.0.1", &r);
         assert!(s.contains("Ping 10.0.0.1"), "{s}");
         assert!(s.contains("完成"), "{s}");
