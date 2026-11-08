@@ -46,6 +46,9 @@ pub struct Nic {
     pub connected: bool,
     pub is_default_route: bool,
     pub metric: u32,
+    /// 跃点是否由系统自动计算（`MIB_IPINTERFACE_ROW.UseAutomaticMetric`）。
+    /// Task 3 先固定 true，Task 4 改成真实读取。
+    pub metric_auto: bool,
     /// 注意：这是 `IP_ADAPTER_ADDRESSES_LH.NetworkGuid`，即 `NET_IF_NETWORK_GUID`
     /// ——**同一网段所有适配器共用**的机器级网络 GUID（真机上 9 条记录全同，
     /// 值 `{60179B30-...}`），**不是**网卡标识，不能用来定位某张卡。
@@ -261,6 +264,7 @@ unsafe fn build_nic(
         connected: a.OperStatus == IfOperStatusUp,
         is_default_route: defaults.contains(&if_index),
         metric: interface_metric(if_index, a.Luid),
+        metric_auto: true,
         network_guid: format_guid(&a.NetworkGuid),
     };
     unsafe { fill_addresses(a, &mut nic) };
@@ -1009,6 +1013,7 @@ mod tests {
             connected: false,
             is_default_route: false,
             metric: 0,
+            metric_auto: true,
             network_guid: String::new(),
         }
     }

@@ -2,7 +2,7 @@
 // 资源 ID 的单一来源在本模块（res/resource.h 是 rc 侧的单一来源，两边数值必须一致）。
 use crate::adapterclass::{kind_name, NicKind};
 use crate::netctl;
-use crate::netinfo::{self, Nic};
+use crate::netinfo::{self, Nic, Route};
 use crate::theme;
 use crate::winutil::wide;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -23,11 +23,11 @@ use windows::Win32::UI::Controls::{
     InitCommonControlsEx, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT,
     CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT,
     ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
-    LVGF_GROUPID, LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS,
-    LVM_ENABLEGROUPVIEW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW,
-    LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW,
-    LVNI_SELECTED, LVN_ITEMCHANGED, LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW,
-    SB_SETPARTS, SB_SETTEXTW,
+    LVGF_GROUPID, LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_PARAM, LVIF_TEXT, LVITEMW,
+    LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
+    LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED, LVN_ITEMCHANGED,
+    LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, SB_SETPARTS, SB_SETTEXTW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -522,6 +522,154 @@ pub unsafe fn refresh_list(hwnd: HWND) {
     }
 }
 
+/// 路由列宽：固定列按内容给足，接口列吃剩余宽度（窄窗口下沉到下限，交给横向滚动条）。
+pub fn route_column_widths(list_client_w: i32) -> [i32; 6] {
+    const DEST: i32 = 170; // 192.168.100.0/24 + 余量
+    const HOP: i32 = 130; // 255.255.255.255
+    const METRIC: i32 = 60;
+    const PROTO: i32 = 70;
+    const ORIGIN: i32 = 70;
+    let iface = (list_client_w - DEST - HOP - METRIC - PROTO - ORIGIN - 2).max(80);
+    [DEST, HOP, iface, METRIC, PROTO, ORIGIN]
+}
+
+/// # Safety
+/// `hwnd` 是主对话框，且 `IDC_ROUTE_LIST` 已创建。
+pub unsafe fn set_route_columns(hwnd: HWND) {
+    let hl = GetDlgItem(Some(hwnd), IDC_ROUTE_LIST as i32).unwrap_or_default();
+    if hl.is_invalid() {
+        return;
+    }
+    for (i, title) in ["目的地址", "下一跳", "接口", "跃点", "协议", "来源"]
+        .iter()
+        .enumerate()
+    {
+        let mut t = wide(title);
+        let mut item = LVCOLUMNW {
+            mask: LVCF_TEXT | LVCF_WIDTH,
+            cx: 100,
+            pszText: PWSTR(t.as_mut_ptr()),
+            cchTextMax: t.len() as i32,
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            hl,
+            LVM_INSERTCOLUMNW,
+            Some(WPARAM(i)),
+            Some(LPARAM((&mut item) as *mut _ as isize)),
+        );
+    }
+    fit_route_columns(hl);
+    enable_full_row_select(hl);
+}
+
+/// # Safety
+/// `hl` 是路由页的 ListView。
+unsafe fn fit_route_columns(hl: HWND) {
+    let mut rc = RECT::default();
+    if GetClientRect(hl, &mut rc).is_err() {
+        return;
+    }
+    for (i, w) in route_column_widths(rc.right - rc.left)
+        .into_iter()
+        .enumerate()
+    {
+        let _ = SendMessageW(
+            hl,
+            LVM_SETCOLUMNWIDTH,
+            Some(WPARAM(i)),
+            Some(LPARAM(w as isize)),
+        );
+    }
+}
+
+/// 接口列文字：优先网卡的本地化名称，查不到时退回 IfIndex。
+pub fn route_interface_text(route: &Route, nics: &[Nic]) -> String {
+    nics.iter()
+        .find(|n| n.if_index == route.if_index)
+        .map(|n| n.alias.clone())
+        .unwrap_or_else(|| format!("IfIndex {}", route.if_index))
+}
+
+/// 填表：先删全部行再插入。路由条目数很少（本机 20~60 行），不需要虚拟列表。
+///
+/// # Safety
+/// `hwnd` 是主对话框，且 `IDC_ROUTE_LIST` 已创建。
+pub unsafe fn populate_routes(hwnd: HWND, routes: &[Route]) {
+    let hl = GetDlgItem(Some(hwnd), IDC_ROUTE_LIST as i32).unwrap_or_default();
+    if hl.is_invalid() {
+        return;
+    }
+    let _ = SendMessageW(hl, LVM_DELETEALLITEMS, None, None);
+    let nics = lock_state().nics.clone();
+    for (row, r) in routes.iter().enumerate() {
+        let cols = [
+            r.destination.clone(),
+            r.next_hop.clone(),
+            route_interface_text(r, &nics),
+            r.metric.to_string(),
+            r.protocol.clone(),
+            r.origin.clone(),
+        ];
+        let first = wide(&cols[0]);
+        // lParam 存 if_index：删除时按接口寻址，不用「接口」列的文字反查
+        let mut it = LVITEMW {
+            mask: LVIF_TEXT | LVIF_PARAM,
+            iItem: row as i32,
+            iSubItem: 0,
+            pszText: PWSTR(first.as_ptr() as *mut u16),
+            cchTextMax: first.len() as i32,
+            lParam: LPARAM(r.if_index as isize),
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            hl,
+            LVM_INSERTITEMW,
+            None,
+            Some(LPARAM(&mut it as *mut LVITEMW as isize)),
+        );
+        for (sub, text) in cols.iter().enumerate().skip(1) {
+            let t = wide(text);
+            let mut item = LVITEMW {
+                mask: LVIF_TEXT,
+                iItem: row as i32,
+                iSubItem: sub as i32,
+                pszText: PWSTR(t.as_ptr() as *mut u16),
+                cchTextMax: t.len() as i32,
+                ..Default::default()
+            };
+            let _ = SendMessageW(
+                hl,
+                LVM_SETITEMTEXTW,
+                Some(WPARAM(row)),
+                Some(LPARAM(&mut item as *mut LVITEMW as isize)),
+            );
+        }
+    }
+}
+
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn routes_are_empty(hwnd: HWND) -> bool {
+    let hl = GetDlgItem(Some(hwnd), IDC_ROUTE_LIST as i32).unwrap_or_default();
+    hl.is_invalid() || SendMessageW(hl, LVM_GETITEMCOUNT, None, None).0 == 0
+}
+
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn refresh_routes(hwnd: HWND) {
+    match netinfo::list_routes() {
+        Ok(routes) => {
+            populate_routes(hwnd, &routes);
+            set_status(hwnd, &format!("共 {} 条路由", routes.len()));
+        }
+        Err(e) => {
+            populate_routes(hwnd, &[]);
+            set_status(hwnd, &format!("读取路由表失败：{e}"));
+        }
+    }
+}
+
 /// 当前选中行号。分组视图下 LVM_GETNEXTITEM 返回的是插入序（= state().nics 下标），
 /// 不是显示序，所以可以直接用来回查数据。
 ///
@@ -911,6 +1059,10 @@ pub unsafe fn apply_page(hwnd: HWND, page: Page) {
         }
     }
     set_current_page(page);
+    // 首次切到路由页才采集，避免每次点击都跑一遍 IP Helper
+    if page == Page::Route && routes_are_empty(hwnd) {
+        refresh_routes(hwnd);
+    }
     for id in NAV_IDS {
         if let Ok(h) = GetDlgItem(Some(hwnd), *id as i32) {
             let _ = InvalidateRect(Some(h), None, true);
@@ -987,6 +1139,10 @@ pub unsafe fn layout(hwnd: HWND) {
     }
     if page == Page::Nic {
         fit_description_column(list_view(hwnd));
+    } else if page == Page::Route {
+        if let Ok(hl) = GetDlgItem(Some(hwnd), IDC_ROUTE_LIST as i32) {
+            fit_route_columns(hl);
+        }
     }
 }
 
@@ -1079,6 +1235,7 @@ pub unsafe extern "system" fn main_dlgproc(
                 );
             }
             set_columns(hwnd);
+            set_route_columns(hwnd);
             ensure_groups(hwnd);
             init_status_bar(hwnd);
             refresh_list(hwnd);
@@ -1121,6 +1278,7 @@ pub unsafe extern "system" fn main_dlgproc(
                 IDC_ENABLE | IDM_ENABLE => on_toggle(hwnd, hl, true),
                 IDC_DISABLE | IDM_DISABLE => on_toggle(hwnd, hl, false),
                 IDC_DETAIL | IDM_DETAIL => open_detail(hwnd),
+                IDC_ROUTE_REFRESH => refresh_routes(hwnd),
                 // 刷新 DNS 缓存由阶段2 接线
                 _ => return 0,
             }
@@ -1188,6 +1346,29 @@ mod tests {
             connected,
             is_default_route: false,
             metric: 0,
+            metric_auto: true,
+            network_guid: String::new(),
+        }
+    }
+
+    /// 路由页测试用的最小网卡。
+    fn test_nic(if_index: u32, alias: &str, kind: NicKind) -> Nic {
+        Nic {
+            if_index,
+            alias: alias.into(),
+            description: String::new(),
+            kind,
+            mac: String::new(),
+            ipv4: String::new(),
+            mask: String::new(),
+            gateway: String::new(),
+            dns: Vec::new(),
+            speed: String::new(),
+            enabled: true,
+            connected: true,
+            is_default_route: false,
+            metric: 0,
+            metric_auto: true,
             network_guid: String::new(),
         }
     }
@@ -1595,6 +1776,41 @@ mod tests {
         assert_eq!(nav_right(&[80, 96, 74], 60), 96);
         assert_eq!(nav_right(&[70], 100), 100);
         assert_eq!(nav_right(&[], 100), 100);
+    }
+
+    #[test]
+    fn route_columns_fit_and_fill() {
+        let w = route_column_widths(900);
+        assert_eq!(w.len(), 6);
+        // 目的 / 下一跳 / 接口 / 跃点 / 协议 / 来源
+        assert!(w[0] >= 150, "目的列装不下 192.168.100.0/24");
+        assert!(w[1] >= 110);
+        assert!(w[3] >= 60, "跃点列装不下 4 位数");
+        assert_eq!(
+            w.iter().sum::<i32>() + 2,
+            900,
+            "六列宽度之和应吃满视口（留 2px 边框）"
+        );
+        // 窄窗口下不低于各自下限，交给横向滚动条
+        let narrow = route_column_widths(300);
+        assert!(narrow.iter().all(|c| *c > 0));
+    }
+
+    #[test]
+    fn route_interface_shows_alias_or_index() {
+        let route = Route {
+            destination: "0.0.0.0/0".into(),
+            next_hop: "192.168.1.1".into(),
+            if_index: 19,
+            metric: 25,
+            protocol: "DHCP".into(),
+            origin: "DHCP".into(),
+            loopback: false,
+            immortal: false,
+        };
+        let nic = test_nic(19, "WLAN", NicKind::Wireless);
+        assert_eq!(route_interface_text(&route, &[nic]), "WLAN");
+        assert_eq!(route_interface_text(&route, &[]), "IfIndex 19");
     }
 
     /// 列表矩形：导航右侧、工具条下方、状态栏上方；极小窗口夹到 0，负宽高会让控件直接不画。

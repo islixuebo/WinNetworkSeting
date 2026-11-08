@@ -376,6 +376,7 @@ mod tests {
             connected: true,
             is_default_route: true,
             metric: 20,
+            metric_auto: true,
             network_guid: "{...}".into(),
         }
     }
