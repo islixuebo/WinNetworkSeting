@@ -3,15 +3,24 @@
 use crate::adapterclass::{kind_name, NicKind};
 use crate::netctl;
 use crate::netinfo::{self, Nic};
+use crate::theme;
 use crate::winutil::wide;
 use std::sync::{Mutex, OnceLock};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Graphics::Gdi::{
+    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, FillRect,
+    RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PS_SOLID,
+    TRANSPARENT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT,
-    CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, ICC_BAR_CLASSES,
+    CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, ICC_BAR_CLASSES,
     ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVGF_GROUPID,
     LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS,
     LVM_ENABLEGROUPVIEW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW,
@@ -23,10 +32,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, GetDlgItem,
     GetSystemMetrics, GetWindowRect, LoadImageW, MessageBoxW, MoveWindow, SendMessageW,
-    TrackPopupMenu, ICON_BIG, ICON_SMALL, IDYES, IMAGE_ICON, LR_SHARED, MB_ICONERROR,
-    MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SM_CXICON,
-    SM_CXSMICON, TPM_LEFTALIGN, TPM_TOPALIGN, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_INITDIALOG,
-    WM_NOTIFY, WM_SETICON, WM_SIZE,
+    SetWindowLongPtrW, TrackPopupMenu, DWLP_MSGRESULT, ICON_BIG, ICON_SMALL, IDYES, IMAGE_ICON,
+    LR_SHARED, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT, MF_GRAYED,
+    MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, TPM_LEFTALIGN, TPM_TOPALIGN,
+    WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_INITDIALOG, WM_NOTIFY,
+    WM_SETFONT, WM_SETICON, WM_SIZE, WM_SYSCOMMAND,
 };
 
 pub const IDD_MAIN: u32 = 100;
@@ -132,9 +142,15 @@ pub unsafe fn set_columns(hwnd: HWND) {
     if hl.is_invalid() {
         return;
     }
-    for (i, (name, width)) in [("状态", 110), ("名称", 210), ("IPv4", 120), ("网关", 120)]
-        .iter()
-        .enumerate()
+    for (i, (name, width)) in [
+        ("状态", 110),
+        ("名称", 160),
+        ("描述", 260),
+        ("IPv4", 120),
+        ("网关", 120),
+    ]
+    .iter()
+    .enumerate()
     {
         let w = wide(name);
         let mut c = LVCOLUMNW {
@@ -187,9 +203,10 @@ pub unsafe fn populate(hwnd: HWND, nics: &[Nic]) {
         );
 
         let name = wide(&n.alias);
+        let desc = wide(&n.description);
         let ip = wide(&n.ipv4);
         let gw = wide(&n.gateway);
-        for (sub_item, text) in [(1, &name), (2, &ip), (3, &gw)] {
+        for (sub_item, text) in [(1, &name), (2, &desc), (3, &ip), (4, &gw)] {
             let mut sub = LVITEMW {
                 mask: LVIF_TEXT,
                 iItem: row as i32,
@@ -497,13 +514,127 @@ pub unsafe fn on_toggle(hwnd: HWND, hl: HWND, enable: bool) {
     sync_buttons(hwnd, hl);
 }
 
-/// COLORREF 是 0x00BBGGRR（不是 RGB 顺序），这里显式拼以免依赖绑定里是否存在 RGB 宏。
-fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32)
+/// 列表字体：Segoe UI，进程内只建一次（OnceLock 存裸句柄值以满足 Sync）。
+/// 负高度按字符高度取整，比默认 MS Shell Dlg 略大，行高随之增高、更易读。
+pub fn ui_font() -> HFONT {
+    static FONT: OnceLock<usize> = OnceLock::new();
+    let raw = *FONT.get_or_init(|| unsafe {
+        let face = wide("Segoe UI");
+        CreateFontW(
+            -17,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            0,
+            PCWSTR(face.as_ptr()),
+        )
+        .0 as usize
+    });
+    HFONT(raw as *mut std::ffi::c_void)
 }
 
-/// 状态列着色：灰=已禁用、蓝=已启用未连接、绿=已连接（与 WPF 版语义一致）。
-/// 三级请求：整表 → 逐项 → 逐项每列；只有最后一级的第 0 列改文字色。
+/// 最小化时收缩工作集：把本进程占用的物理页交还系统，降低任务管理器里的可见占用。
+/// 私有提交量（验收口径）不受影响；纯展示层优化，事件驱动、无常驻轮询。
+fn trim_working_set() {
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+/// 自绘状态胶囊：圆角底色 + 同色圆点 + 文字。返回 CDRF_SKIPDEFAULT 后本格背景须自己填。
+///
+/// # Safety
+/// `hdc` 必须是 custom-draw 通知里有效的设备上下文；`cell` 是该格矩形。
+unsafe fn draw_status_pill(
+    hdc: HDC,
+    cell: &RECT,
+    row_bg: COLORREF,
+    fg: COLORREF,
+    pill_bg: COLORREF,
+    text: &str,
+) {
+    // 单元格背景（隔行浅灰 / 选中浅蓝）
+    let bg_brush = CreateSolidBrush(row_bg);
+    FillRect(hdc, cell, bg_brush);
+    let _ = DeleteObject(HGDIOBJ(bg_brush.0));
+
+    SetBkMode(hdc, TRANSPARENT);
+    let mut buf: Vec<u16> = text.encode_utf16().collect();
+
+    // 量文字尺寸（DT_CALCRECT 只算不画）
+    let mut m = RECT::default();
+    DrawTextW(
+        hdc,
+        &mut buf,
+        &mut m,
+        DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    let text_w = (m.right - m.left).max(0);
+    let text_h = (m.bottom - m.top).max(0);
+
+    // 胶囊几何：左边距 + 圆点 + 间距 + 文字 + 右留白；垂直居中于单元格
+    let pad_x = 8;
+    let dot_d = 6;
+    let gap = 6;
+    let cell_h = cell.bottom - cell.top;
+    let pill_h = (cell_h - 6).max(text_h + 4).min(cell_h);
+    let pill_w = pad_x + dot_d + gap + text_w + pad_x;
+    let left = cell.left + 6;
+    let top = cell.top + ((cell_h - pill_h) / 2).max(0);
+    let right = left + pill_w;
+    let bottom = top + pill_h;
+
+    // 圆角底：笔与刷同色，边框不可见，呈柔和胶囊
+    let brush = CreateSolidBrush(pill_bg);
+    let pen = CreatePen(PS_SOLID, 1, pill_bg);
+    let old_b = SelectObject(hdc, HGDIOBJ(brush.0));
+    let old_p = SelectObject(hdc, HGDIOBJ(pen.0));
+    let _ = RoundRect(hdc, left, top, right, bottom, pill_h, pill_h);
+    SelectObject(hdc, old_b);
+    SelectObject(hdc, old_p);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+    let _ = DeleteObject(HGDIOBJ(pen.0));
+
+    // 前景圆点
+    let dot_brush = CreateSolidBrush(fg);
+    let dot_pen = CreatePen(PS_SOLID, 1, fg);
+    let old_b = SelectObject(hdc, HGDIOBJ(dot_brush.0));
+    let old_p = SelectObject(hdc, HGDIOBJ(dot_pen.0));
+    let cy = top + pill_h / 2;
+    let dl = left + pad_x;
+    let _ = Ellipse(hdc, dl, cy - dot_d / 2, dl + dot_d, cy + dot_d / 2);
+    SelectObject(hdc, old_b);
+    SelectObject(hdc, old_p);
+    let _ = DeleteObject(HGDIOBJ(dot_brush.0));
+    let _ = DeleteObject(HGDIOBJ(dot_pen.0));
+
+    // 文字
+    SetTextColor(hdc, fg);
+    let mut tr = RECT {
+        left: dl + dot_d + gap,
+        top,
+        right: right - pad_x,
+        bottom,
+    };
+    DrawTextW(
+        hdc,
+        &mut buf,
+        &mut tr,
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
+}
+
+/// 浅色精修：隔行浅灰底、选中整行柔和浅蓝、名称深色 / IPv4·网关浅灰，
+/// 状态列自绘圆角胶囊（灰=已禁用、蓝=已启用未连接、绿=已连接）。
+/// 三级请求：整表 → 逐项 → 逐项每列；第 0 列自绘并 SKIPDEFAULT，其余列改色回 NEWFONT。
 ///
 /// # Safety
 /// `nmh` 必须指向本次 WM_NOTIFY 的真实 NMHDR（调用方从 lParam 转出）。
@@ -517,29 +648,42 @@ pub unsafe fn on_list_notify(hwnd: HWND, nmh: &mut NMHDR) -> Option<isize> {
     let stage = cd.nmcd.dwDrawStage.0;
 
     if stage == CDDS_PREPAINT.0 {
-        // CDRF_NOTIFYITEMDRAW 才会换来 ITEMPREPAINT 通知；
-        // 简报这里写的 CDRF_NEWFONT 不请求下一级，颜色永远不会生效
+        // CDRF_NOTIFYITEMDRAW 才会换来 ITEMPREPAINT 通知
         return Some(CDRF_NOTIFYITEMDRAW as isize);
     }
     if stage == CDDS_ITEMPREPAINT.0 {
         return Some(CDRF_NOTIFYSUBITEMDRAW as isize);
     }
     if stage == CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0 {
+        let row = cd.nmcd.dwItemSpec;
+        // 不信任 uItemState（实测分组报表下它对每行都置 CDIS_SELECTED，导致整表像全选）；
+        // 用 LVM_GETNEXTITEM 的真实选中行回查，未选中时返回 None。
+        let selected = selected_index(list_view(hwnd)) == Some(row);
+        let bg = theme::row_bg(selected, row);
         if cd.iSubItem == 0 {
-            let color = {
+            let (fg, pill_bg, text) = {
                 let guard = lock_state();
-                match guard.nics.get(cd.nmcd.dwItemSpec) {
-                    Some(n) if !n.enabled => rgb(0x80, 0x80, 0x80),
-                    Some(n) if !n.connected => rgb(0x1A, 0x5F, 0xB4),
-                    Some(_) => rgb(0x1B, 0x7A, 0x3D),
+                match guard.nics.get(row) {
+                    Some(n) => {
+                        let (fg, pbg) = theme::status_colors(n.enabled, n.connected);
+                        (fg, pbg, status_text(n))
+                    }
                     None => return Some(CDRF_DODEFAULT as isize),
                 }
             };
-            cd.clrText = color;
-            // 改了颜色必须回 CDRF_NEWFONT，控件才会采用新值
-            return Some(CDRF_NEWFONT as isize);
+            draw_status_pill(cd.nmcd.hdc, &cd.nmcd.rc, bg, fg, pill_bg, &text);
+            return Some(CDRF_SKIPDEFAULT as isize);
         }
-        return Some(CDRF_DODEFAULT as isize);
+        // 名称列深色突出，IPv4/网关浅灰次要；选中行统一深蓝文字
+        cd.clrText = if selected {
+            theme::SELECT_TEXT
+        } else if cd.iSubItem == 1 {
+            theme::TEXT
+        } else {
+            theme::TEXT_DIM
+        };
+        cd.clrTextBk = bg;
+        return Some(CDRF_NEWFONT as isize);
     }
     None
 }
@@ -613,7 +757,16 @@ pub unsafe extern "system" fn main_dlgproc(
     match msg {
         WM_INITDIALOG => {
             set_title_icons(hwnd);
-            enable_full_row_select(list_view(hwnd));
+            let hl = list_view(hwnd);
+            enable_full_row_select(hl);
+            if !hl.is_invalid() {
+                SendMessageW(
+                    hl,
+                    WM_SETFONT,
+                    Some(WPARAM(ui_font().0 as usize)),
+                    Some(LPARAM(1)),
+                );
+            }
             set_columns(hwnd);
             ensure_groups(hwnd);
             init_status_bar(hwnd);
@@ -650,10 +803,25 @@ pub unsafe extern "system" fn main_dlgproc(
                 sync_buttons(hwnd, nmh.hwndFrom);
                 return 0;
             }
-            on_list_notify(hwnd, nmh).unwrap_or(0)
+            match on_list_notify(hwnd, nmh) {
+                Some(result) => {
+                    // 对话框过程的返回值只是「是否处理」BOOL；custom-draw 的 CDRF 结果
+                    // 必须写进 DWLP_MSGRESULT，否则永远被当成 0(DODEFAULT)，自绘/着色全失效。
+                    SetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(DWLP_MSGRESULT as i32), result);
+                    1
+                }
+                None => 0,
+            }
         }
         WM_SIZE => {
             layout(hwnd);
+            0
+        }
+        WM_SYSCOMMAND => {
+            // 低 4 位另有用途，按文档掩掉再比；返回 0 让系统继续默认最小化
+            if (wparam.0 & 0xFFF0) == SC_MINIMIZE as usize {
+                trim_working_set();
+            }
             0
         }
         WM_CLOSE => {
@@ -769,16 +937,6 @@ mod tests {
         assert_eq!(group_of(NicKind::Wired), 0);
         assert_eq!(group_of(NicKind::Wireless), 1);
         assert_eq!(group_of(NicKind::Other), 2);
-    }
-
-    /// COLORREF 是 0x00BBGGRR：拼错顺序会让蓝/绿互换，真机上很难一眼看出
-    #[test]
-    fn colorref_is_bgr_order() {
-        assert_eq!(rgb(0x1A, 0x5F, 0xB4).0, 0x00B4_5F1A);
-        assert_eq!(rgb(0x1B, 0x7A, 0x3D).0, 0x003D_7A1B);
-        assert_eq!(rgb(0x80, 0x80, 0x80).0, 0x0080_8080);
-        assert_eq!(rgb(0xFF, 0, 0).0, 0x0000_00FF);
-        assert_eq!(rgb(0, 0, 0xFF).0, 0x00FF_0000);
     }
 
     /// 资源 ID 必须与 res/resource.h 逐字一致（rc 侧改了这边没改会静默错位）

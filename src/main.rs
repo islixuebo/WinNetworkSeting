@@ -4,6 +4,7 @@ pub mod adapterclass;
 pub mod detail;
 pub mod netctl;
 pub mod netinfo;
+pub mod theme;
 pub mod ui;
 pub mod winutil;
 
