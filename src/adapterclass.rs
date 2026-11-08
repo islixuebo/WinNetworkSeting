@@ -2,11 +2,13 @@
 // 模块挂载约定：本仓库统一 `pub mod xxx;`，不使用 `#![allow(dead_code)]`；
 // 本模块全是纯函数，没有 `pub unsafe fn`，故无需 `# Safety` 章节。
 
-/// 网卡大类：有线 / 无线 / 其他。Task 5 的分组标题与排序键都由它派生。
+/// 网卡大类：有线 / 无线 / VPN / 虚拟 / 其他。Task 5 的分组标题与排序键都由它派生。
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum NicKind {
     Wired,
     Wireless,
+    Vpn,
+    Virtual,
     Other,
 }
 
@@ -26,20 +28,66 @@ pub const IF_TYPE_TUNNEL: u32 = 131;
 /// `description` 传 IP_ADAPTER_ADDRESSES_LH.Description（驱动描述，通常是英文），
 /// 不要传本地化的 FriendlyName，否则关键字表失效。
 ///
+/// 判定顺序（后面的分支都会被前面短路）：
+/// 蓝牙 → VPN → 虚拟 → 按 IfType 分有线/无线 → 关键字回退 → 其他。
+/// VPN 必须排在虚拟前面：VPN 客户端常装成虚拟网卡（TAP-Windows 报 IfType=6，
+/// Sangfor aTrust 报 53），先按虚拟判就会被吞进虚拟组。
+///
 /// 跨任务契约：虚拟网卡（Hyper-V、VPN、隧道）常带**物理** IfType（例如 Hyper-V
 /// 虚拟以太网适配器就是 6），所以 `NicKind` 不可用来推断「这是物理卡」——
 /// 过滤只能靠 `is_virtual` + `is_virtual_if_type` + 物理地址长度。
 pub fn classify(if_type: u32, description: &str) -> NicKind {
+    let d = description.to_ascii_lowercase();
     // 蓝牙 PAN 实测 IfType=6(Ethernet)、真正的物理介质才是 Bluetooth；若只看 IfType
     // 会误判成有线。蓝牙面板按用户裁定单列为「其他」，且优先于 IfType 判定。
-    if description.to_ascii_lowercase().contains("bluetooth") {
+    if d.contains("bluetooth") {
         return NicKind::Other;
+    }
+    if is_vpn(description) {
+        return NicKind::Vpn;
+    }
+    if is_virtual(description) || is_virtual_if_type(if_type) {
+        return NicKind::Virtual;
     }
     match if_type {
         IF_TYPE_ETHERNET => NicKind::Wired,
         IF_TYPE_IEEE80211 | IF_TYPE_WWANPP | IF_TYPE_WWANPP2 => NicKind::Wireless,
         _ => keyword_fallback(description),
     }
+}
+
+/// VPN 客户端/隧道适配器。与 `is_virtual` 分开是因为它们要单独成组：
+/// 用户会主动连 VPN，而 Hyper-V/VMware 那类虚拟网卡只是顺带存在。
+///
+/// 关键字按厂商驱动描述取样（TAP-Windows、Sangfor aTrust、Cisco AnyConnect、
+/// WireGuard 等），加上中文系统自带的「虚拟专用网络」。
+pub fn is_vpn(description: &str) -> bool {
+    let d = description.to_ascii_lowercase();
+    [
+        "vpn",
+        "tap-windows",
+        "tap-",
+        "openvpn",
+        "wireguard",
+        "wintun",
+        "anyconnect",
+        "atrust",
+        "sangfor",
+        "pptp",
+        "l2tp",
+        "sstp",
+        "ikev2",
+        "globalprotect",
+        "forticlient",
+        "pulse secure",
+        "softether",
+        "openconnect",
+        "zerotier",
+        "tailscale",
+        "虚拟专用网络",
+    ]
+    .iter()
+    .any(|k| d.contains(k))
 }
 
 /// 关键字回退：先判无线再判有线（描述里两者都出现时按无线算）。
@@ -72,20 +120,25 @@ pub fn kind_name(k: NicKind) -> &'static str {
     match k {
         NicKind::Wired => "有线网卡",
         NicKind::Wireless => "无线网卡",
+        NicKind::Vpn => "VPN",
+        NicKind::Virtual => "虚拟网卡",
         NicKind::Other => "其他",
     }
 }
 
-/// 列表分组排序键：0 有线、1 无线、2 其他。
+/// 列表分组排序键：0 有线、1 无线、2 VPN、3 虚拟、4 其他。
 pub fn group_order(k: NicKind) -> u8 {
     match k {
         NicKind::Wired => 0,
         NicKind::Wireless => 1,
-        NicKind::Other => 2,
+        NicKind::Vpn => 2,
+        NicKind::Virtual => 3,
+        NicKind::Other => 4,
     }
 }
 
-/// 虚拟/隧道网卡：这些不是用户要管理的物理网卡
+/// 虚拟/隧道网卡：这些不是用户要管理的物理网卡。
+/// VPN 也命中这张表（TAP 等），需要区分时先问 `is_vpn`。
 pub fn is_virtual(description: &str) -> bool {
     let d = description.to_ascii_lowercase();
     [
@@ -152,10 +205,7 @@ mod tests {
             NicKind::Wireless
         );
         assert_eq!(classify(0, "Realtek PCIe GbE Family"), NicKind::Wired);
-        assert_eq!(
-            classify(0, "Microsoft Kernel Debug Network"),
-            NicKind::Other
-        );
+        assert_eq!(classify(0, "Some Unclassified Adapter"), NicKind::Other);
     }
 
     #[test]
@@ -182,9 +232,29 @@ mod tests {
     fn kind_name_and_order() {
         assert_eq!(kind_name(NicKind::Wired), "有线网卡");
         assert_eq!(kind_name(NicKind::Wireless), "无线网卡");
+        assert_eq!(kind_name(NicKind::Vpn), "VPN");
+        assert_eq!(kind_name(NicKind::Virtual), "虚拟网卡");
         assert_eq!(kind_name(NicKind::Other), "其他");
-        assert!(group_order(NicKind::Wired) < group_order(NicKind::Wireless));
-        assert!(group_order(NicKind::Wireless) < group_order(NicKind::Other));
+
+        // 分组顺序：有线 → 无线 → VPN → 虚拟 → 其他
+        let mut kinds = [
+            NicKind::Other,
+            NicKind::Virtual,
+            NicKind::Vpn,
+            NicKind::Wireless,
+            NicKind::Wired,
+        ];
+        kinds.sort_by_key(|k| group_order(*k));
+        assert_eq!(
+            kinds,
+            [
+                NicKind::Wired,
+                NicKind::Wireless,
+                NicKind::Vpn,
+                NicKind::Virtual,
+                NicKind::Other
+            ]
+        );
     }
 
     // ---- 以下是对简报用例的补强：每个 IF_TYPE 分支、每个关键字都要有独立判别力 ----
@@ -193,7 +263,7 @@ mod tests {
     /// 每行描述都刻意只命中一个关键字，保证「删掉某个关键字」必有对应用例变红。
     #[test]
     fn classify_covers_every_if_type_and_keyword() {
-        let cases: [(&str, u32, &str, NicKind); 23] = [
+        let cases: [(&str, u32, &str, NicKind); 27] = [
             // IF_TYPE 精确分支：命中时描述完全不起作用
             ("if_type=6 有线", 6, "Something Unknown", NicKind::Wired),
             (
@@ -250,19 +320,39 @@ mod tests {
             ),
             // 未知 IF_TYPE 且两边关键字都不命中 → Other
             (
-                "0/无关键字",
+                "0/kernel debug",
                 0,
                 "Microsoft Kernel Debug Network",
-                NicKind::Other,
+                NicKind::Virtual,
             ),
             (
-                "1/无关键字",
+                "1/loopback",
                 1,
                 "Software Loopback Interface",
+                NicKind::Virtual,
+            ),
+            (
+                "1/真无关键字",
+                1,
+                "Some Unclassified Adapter",
                 NicKind::Other,
             ),
-            ("24/无关键字", 24, "WAN Miniport (IP)", NicKind::Other),
-            ("53/无关键字", 53, "Unknown Device", NicKind::Other),
+            ("24/无关键字", 24, "WAN Miniport (IP)", NicKind::Virtual),
+            ("53/无关键字", 53, "Unknown Device", NicKind::Virtual),
+            // VPN 与虚拟网卡各有专属分支
+            (
+                "6/TAP 虚拟网卡但属于 VPN",
+                6,
+                "TAP-Windows Adapter V9",
+                NicKind::Vpn,
+            ),
+            ("53/aTrust", 53, "Sangfor aTrust VNIC", NicKind::Vpn),
+            (
+                "6/Hyper-V",
+                6,
+                "Hyper-V Virtual Ethernet Adapter",
+                NicKind::Virtual,
+            ),
             // Task 4 边界：Description 为空/空白时不得 panic，也不得凭空归类
             ("0/空描述", 0, "", NicKind::Other),
             ("29/空白描述", 29, " ", NicKind::Other),
@@ -299,6 +389,54 @@ mod tests {
         assert_eq!(classify(6, "Realtek PCIe GbE Family"), NicKind::Wired);
     }
 
+    /// VPN 优先于虚拟与 IfType：VPN 客户端本身就是虚拟网卡（TAP 报 6、aTrust 报 53），
+    /// 若先按虚拟判就会并进「虚拟网卡」组。
+    #[test]
+    fn vpn_wins_over_virtual_and_if_type() {
+        for (if_type, d) in [
+            (6, "TAP-Windows Adapter V9"),
+            (6, "OpenVPN Wintun"),
+            (53, "Sangfor aTrust VNIC"),
+            (53, "aTrustXtun Userspace Tunnel"),
+            (0, "Cisco AnyConnect Secure Mobility Virtual Adapter"),
+            (0, "WireGuard Tunnel"),
+            (0, "Fortinet SSL VPN Virtual Ethernet Adapter"),
+        ] {
+            assert_eq!(classify(if_type, d), NicKind::Vpn, "if_type={if_type}：{d}");
+        }
+        assert!(is_vpn("某公司虚拟专用网络适配器"));
+        // 物理网卡与普通虚拟网卡不得被 VPN 关键字误伤
+        assert!(!is_vpn("Hyper-V Virtual Ethernet Adapter"));
+        assert!(!is_vpn("Realtek PCIe GbE Family Controller"));
+        assert!(!is_vpn("Intel(R) Wi-Fi 6E AX211"));
+    }
+
+    /// 虚拟网卡单独成组：Hyper-V / VMware / 隧道接口即使报的是物理 IfType 也归虚拟。
+    #[test]
+    fn virtual_group_covers_hyperv_vmware_and_tunnels() {
+        for (if_type, d) in [
+            (6, "Hyper-V Virtual Ethernet Adapter"),
+            (6, "VMware Network Adapter VMnet8"),
+            (6, "VirtualBox Host-Only Network Adapter"),
+            (131, "Microsoft IP-HTTPS 平台适配器"),
+            (53, "某虚拟适配器"),
+        ] {
+            assert_eq!(
+                classify(if_type, d),
+                NicKind::Virtual,
+                "if_type={if_type}：{d}"
+            );
+        }
+        // 隧道/内部 IfType 即使描述完全认不出来也进虚拟组
+        assert_eq!(classify(131, "Unknown Tunnel"), NicKind::Virtual);
+        assert_eq!(classify(53, "Unknown Device"), NicKind::Virtual);
+        // 有线/无线的判定不受影响
+        assert_eq!(
+            classify(6, "Realtek USB GbE Family Controller"),
+            NicKind::Wired
+        );
+    }
+
     /// 回退分支里无线判定先于有线判定（简报的实现顺序）：混合关键字时必须是无线。
     #[test]
     fn wireless_keyword_takes_precedence_over_ethernet_keyword() {
@@ -328,17 +466,34 @@ mod tests {
         assert!(is_virtual("wAn mInIpOrT (IP)"));
     }
 
-    /// group_order 的绝对值（简报 Interfaces 要求 0/1/2，Task 5 排序键直接用）。
+    /// group_order 的绝对值（Task 5 排序键直接用）。
     #[test]
     fn group_order_absolute_values() {
         assert_eq!(group_order(NicKind::Wired), 0);
         assert_eq!(group_order(NicKind::Wireless), 1);
-        assert_eq!(group_order(NicKind::Other), 2);
+        assert_eq!(group_order(NicKind::Vpn), 2);
+        assert_eq!(group_order(NicKind::Virtual), 3);
+        assert_eq!(group_order(NicKind::Other), 4);
 
         // 排序键契约：Task 5 用它把有线排在最前、其他垫底
-        let mut kinds = [NicKind::Other, NicKind::Wireless, NicKind::Wired];
+        let mut kinds = [
+            NicKind::Other,
+            NicKind::Virtual,
+            NicKind::Vpn,
+            NicKind::Wireless,
+            NicKind::Wired,
+        ];
         kinds.sort_by_key(|k| group_order(*k));
-        assert_eq!(kinds, [NicKind::Wired, NicKind::Wireless, NicKind::Other]);
+        assert_eq!(
+            kinds,
+            [
+                NicKind::Wired,
+                NicKind::Wireless,
+                NicKind::Vpn,
+                NicKind::Virtual,
+                NicKind::Other
+            ]
+        );
     }
 
     /// 虚拟关键字表逐条命中（第一列是被钉住的关键字）。
@@ -389,9 +544,9 @@ mod tests {
         }
     }
 
-    /// 已知盲区的机制留档（不是对正确性的背书）：关键字表是英文的，纯中文描述一律不命中，
-    /// 所以 `is_virtual("虚拟专用网络适配器")` 为 false。真实过滤由 netinfo 并联
-    /// `is_virtual_if_type` + 物理地址长度兜底，见 `is_filtered_out`。
+    /// 已知盲区的机制留档（不是对正确性的背书）：`is_virtual` 的关键字表是英文的，
+    /// 纯中文描述一律不命中，所以 `is_virtual("虚拟专用网络适配器")` 为 false。
+    /// 分类侧另有中文 VPN 关键字与结构化 IfType 兜底，见 `classify`。
     #[test]
     fn chinese_descriptions_are_a_known_blind_spot() {
         // IF_TYPE 命中时中文描述无影响
@@ -401,6 +556,8 @@ mod tests {
         assert_eq!(classify(0, "无线局域网适配器"), NicKind::Other);
         assert_eq!(classify(0, "以太网 网络适配器"), NicKind::Other);
         assert!(!is_virtual("虚拟专用网络适配器"));
+        // 中文 VPN 描述单独有词条，能进 VPN 组
+        assert_eq!(classify(0, "虚拟专用网络适配器"), NicKind::Vpn);
         // 中英混排时只要含 ASCII 关键字就仍算虚拟
         assert!(is_virtual("Hyper-V 虚拟以太网适配器"));
     }
@@ -454,9 +611,15 @@ mod tests {
         let b = a; // Copy：按值移动后 a 仍可用
         assert_eq!(a, b); // PartialEq
         assert_eq!(Clone::clone(&a), b); // Clone（显式函数形式，避开 clone_on_copy）
-        let all = [NicKind::Wired, NicKind::Wireless, NicKind::Other];
+        let all = [
+            NicKind::Wired,
+            NicKind::Wireless,
+            NicKind::Vpn,
+            NicKind::Virtual,
+            NicKind::Other,
+        ];
         // Debug：变体名可读（Task 7 详情/日志会直接打印）
-        assert_eq!(format!("{all:?}"), "[Wired, Wireless, Other]");
+        assert_eq!(format!("{all:?}"), "[Wired, Wireless, Vpn, Virtual, Other]");
         assert_ne!(NicKind::Wired, NicKind::Other);
         // Eq 语义：分组去重/比较按值而非按引用
         assert_eq!(all.iter().filter(|&&k| k == NicKind::Wired).count(), 1);

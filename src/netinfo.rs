@@ -1,7 +1,7 @@
 // Task 4：netinfo —— 基于 IP Helper API 的网卡信息采集。
 // 模块挂载约定：本仓库统一 `pub mod xxx;`，不使用 `#![allow(dead_code)]`；
 // `pub unsafe fn` / 私有 `unsafe fn` 都写 `# Safety` 章节。
-use crate::adapterclass::{classify, group_order, is_virtual, is_virtual_if_type, NicKind};
+use crate::adapterclass::{classify, group_order, NicKind, IF_TYPE_SOFTWARE_LOOPBACK};
 use crate::winutil::{error_text, wstr_from_ptr};
 use std::cmp::Ordering;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -140,10 +140,14 @@ fn format_guid(guid: &GUID) -> String {
     )
 }
 
-/// 列表过滤口径（Task 5 直接依赖）：关键字表命中、或结构化 IfType 命中、
-/// 或是 NDIS 筛选器绑定、或（未禁用且没有物理地址）。
-/// 多条并联而不是只靠 `is_virtual` 单打独斗 —— 中文 Windows 自带驱动的描述是中文，
-/// 13 个英文关键字必然漏判，见 `adapterclass::is_virtual_if_type`。
+/// 列表过滤口径：只滤掉「不是一张可管理网卡」的伪接口与 NDIS 重复项。
+/// 虚拟网卡和 VPN 适配器不再整类隐藏 —— 它们分别进「虚拟网卡」「VPN」分组。
+///
+/// 仍然拦掉的：
+/// - NDIS 筛选器绑定（一张卡会拖出 4 行同名重复项，见 `is_filter_binding`）；
+/// - 环回（IfType=24）、WAN Miniport 系列（PPP 栈内部实现，无地址）、内核调试适配器、
+///   Hyper-V 虚拟交换机扩展（是 vSwitch 的组件，不是接口）；
+/// - 启用中却没有物理地址、又归不进 VPN/虚拟的幽灵接口。
 ///
 /// `is_admin_disabled` 单独开一个口子：网卡被禁用后驱动往往不再上报物理地址
 /// （真机实测 Realtek USB GbE 禁用后 `PhysicalAddressLength` 归 0），
@@ -154,10 +158,22 @@ fn is_filtered_out(
     physical_address_length: u32,
     is_admin_disabled: bool,
 ) -> bool {
-    is_virtual(description)
-        || is_virtual_if_type(if_type)
-        || is_filter_binding(description)
-        || (physical_address_length == 0 && !is_admin_disabled)
+    let d = description.to_ascii_lowercase();
+    if is_filter_binding(description)
+        || if_type == IF_TYPE_SOFTWARE_LOOPBACK
+        || d.contains("wan miniport")
+        // 中文系统里 WAN Miniport 叫「WAN 微型端口 (IP)/(PPPOE)」，是 PPP 栈的内部实现
+        || d.contains("微型端口")
+        || d.contains("kernel debug")
+        || d.contains("virtual switch extension")
+    {
+        return true;
+    }
+    match classify(if_type, description) {
+        // 两个专属分组一律展示，包括只有名称没有 MAC 的条目
+        NicKind::Vpn | NicKind::Virtual => false,
+        _ => physical_address_length == 0 && !is_admin_disabled,
+    }
 }
 
 /// NDIS 筛选器绑定伪接口的命名约定：`<父接口描述>-<筛选器名>-<4 位十六进制实例号>`
@@ -688,7 +704,7 @@ mod tests {
 
     // ---------------- 过滤判据 ----------------
 
-    /// 控制器裁定：过滤 = is_virtual(描述) || is_virtual_if_type(IfType) || (无物理地址且未禁用)。
+    /// 过滤口径：伪接口/NDIS 重复项拦掉；虚拟网卡与 VPN 适配器保留（各有分组）。
     /// 下面全部按「启用中」（第 4 参 false）取样，禁用带来的 MAC 缺失例外单独测。
     #[test]
     fn filter_rule_table() {
@@ -709,38 +725,71 @@ mod tests {
             !is_filtered_out(6, "以太网 网络适配器", 6, false),
             "本地化中文描述不得被误杀"
         );
-        // 关键字命中（英文虚拟描述）
-        assert!(is_filtered_out(
+        // 虚拟网卡、VPN 适配器不再隐藏：分别进「虚拟网卡」「VPN」分组
+        assert!(
+            !is_filtered_out(6, "Hyper-V Virtual Ethernet Adapter", 6, false),
+            "Hyper-V 虚拟网卡应保留（进虚拟组）"
+        );
+        assert!(
+            !is_filtered_out(53, "Sangfor aTrust VNIC", 6, false),
+            "VPN 适配器应保留（进 VPN 组）"
+        );
+        assert!(
+            !is_filtered_out(6, "TAP-Windows Adapter V9", 6, false),
+            "TAP 是 VPN 适配器，应保留"
+        );
+        // 无 MAC 的虚拟/VPN 条目也要保留（vSwitch 组件、隧道口常没有 MAC）
+        assert!(!is_filtered_out(
             6,
             "Hyper-V Virtual Ethernet Adapter",
+            0,
+            false
+        ));
+        assert!(!is_filtered_out(
+            53,
+            "aTrustXtun Userspace Tunnel",
+            0,
+            false
+        ));
+        // 伪接口与 NDIS 重复项继续拦掉
+        assert!(
+            is_filtered_out(24, "Software Loopback Interface 1", 0, false),
+            "环回=24 必须过滤"
+        );
+        assert!(
+            is_filtered_out(23, "WAN Miniport (PPPOE)", 0, false),
+            "WAN Miniport 是 PPP 栈内部实现"
+        );
+        assert!(
+            is_filtered_out(23, "WAN 微型端口 (IP)", 0, false),
+            "中文 WAN 微型端口同样要滤掉"
+        );
+        assert!(is_filtered_out(
+            6,
+            "Microsoft Kernel Debug Network Adapter",
+            0,
+            false
+        ));
+        assert!(is_filtered_out(
+            6,
+            "Hyper-V Virtual Switch Extension Adapter",
+            0,
+            false
+        ));
+        assert!(is_filtered_out(
+            6,
+            "Hyper-V Virtual Ethernet Adapter-QoS Packet Scheduler-0000",
             6,
             false
         ));
-        assert!(is_filtered_out(6, "TAP-Windows Adapter V9", 6, false));
-        // 结构化 IfType 命中：中文 Windows 上自带驱动的描述是中文，只能靠 IfType 兜住
-        assert!(
-            is_filtered_out(23, "WAN 微型端口 (IP)", 0, false),
-            "PPP=23 必须算虚拟"
-        );
-        assert!(
-            is_filtered_out(131, "Microsoft IP-HTTPS 平台适配器", 0, false),
-            "TUNNEL=131 必须算虚拟"
-        );
-        assert!(
-            is_filtered_out(53, "某国产 VPN 适配器", 6, false),
-            "PROP_VIRTUAL=53 必须算虚拟"
-        );
-        assert!(
-            is_filtered_out(24, "Software Loopback Interface 1", 0, false),
-            "环回=24 必须算虚拟"
-        );
-        // 启用中却没有物理地址 → 按虚拟滤掉
+        // 启用中却没有物理地址、也认不出是虚拟/VPN → 按幽灵接口滤掉
         assert!(
             is_filtered_out(6, "Some Physical Adapter", 0, false),
             "PhysicalAddressLength=0 且未禁用必须滤掉"
         );
-        // 已知残留风险（如实留档）：纯中文虚拟名 + 物理 IfType + 有 MAC 时仍会留下
+        // 已知残留风险（如实留档）：纯中文虚拟名 + 物理 IfType + 有 MAC 时会留在「其他」
         assert!(!is_filtered_out(6, "虚拟以太网适配器", 6, false));
+        assert!(is_filtered_out(6, "虚拟以太网适配器", 0, false));
     }
 
     /// 禁用中的物理网卡常常不再上报 MAC（真机实测：Realtek USB GbE 禁用后 maclen 归 0）。
@@ -760,14 +809,14 @@ mod tests {
             0,
             false
         ));
-        // 关键字/结构化 IfType 命中时，禁用也救不回来
+        // 伪接口即使被禁用也不会回到列表
         assert!(is_filtered_out(
-            6,
-            "Hyper-V Virtual Ethernet Adapter",
+            24,
+            "Software Loopback Interface 1",
             0,
             true
         ));
-        assert!(is_filtered_out(131, "某国产 VPN 适配器", 0, true));
+        assert!(is_filtered_out(6, "WAN Miniport (IP)", 0, true));
     }
 
     /// 筛选器绑定必须整类拦掉：一张 WLAN 会拖出 4 行同名重复项。
@@ -821,22 +870,30 @@ mod tests {
         }
     }
 
-    /// 分组次序（有线 → 无线 → 其他）压过名称次序，组内按名称小写比较。
+    /// 分组次序（有线 → 无线 → VPN → 虚拟 → 其他）压过名称次序，组内按名称小写比较。
     #[test]
     fn sort_groups_before_names() {
         let mut v = vec![
             test_nic(1, "alpha-other", NicKind::Other),
+            test_nic(4, "delta-virtual", NicKind::Virtual),
+            test_nic(5, "eps-vpn", NicKind::Vpn),
             test_nic(2, "zeta-wired", NicKind::Wired),
             test_nic(3, "mid-wireless", NicKind::Wireless),
         ];
         sort_nics(&mut v);
         assert_eq!(
             v.iter().map(|n| n.alias.as_str()).collect::<Vec<_>>(),
-            vec!["zeta-wired", "mid-wireless", "alpha-other"]
+            vec![
+                "zeta-wired",
+                "mid-wireless",
+                "eps-vpn",
+                "delta-virtual",
+                "alpha-other"
+            ]
         );
         assert_eq!(
             v.iter().map(|n| n.if_index).collect::<Vec<_>>(),
-            vec![2, 3, 1]
+            vec![2, 3, 5, 4, 1]
         );
     }
 

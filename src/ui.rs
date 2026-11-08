@@ -54,7 +54,9 @@ pub const IDM_DETAIL: u32 = 2002;
 
 pub const GRP_WIRED: i32 = 0;
 pub const GRP_WIRELESS: i32 = 1;
-pub const GRP_OTHER: i32 = 2;
+pub const GRP_VPN: i32 = 2;
+pub const GRP_VIRTUAL: i32 = 3;
+pub const GRP_OTHER: i32 = 4;
 
 // 列表列宽（px）。IPv4/网关按 15 字符（169.254.xxx.xxx）留量；描述列在布局时吃掉剩余宽度，
 // 固定像素在窄窗口里会被视口直接裁掉，连省略号都看不到。
@@ -112,11 +114,13 @@ fn group_of(kind: NicKind) -> i32 {
     match kind {
         NicKind::Wired => GRP_WIRED,
         NicKind::Wireless => GRP_WIRELESS,
+        NicKind::Vpn => GRP_VPN,
+        NicKind::Virtual => GRP_VIRTUAL,
         NicKind::Other => GRP_OTHER,
     }
 }
 
-/// 建立三个分组。分组视图默认是关的，必须先 LVM_ENABLEGROUPVIEW，
+/// 建立分组。分组视图默认是关的，必须先 LVM_ENABLEGROUPVIEW，
 /// 否则插了组也不显示标题（简报 Step 2 的「若标题不出现」正是这个原因）。
 ///
 /// # Safety
@@ -130,6 +134,8 @@ pub unsafe fn ensure_groups(hwnd: HWND) {
     for (id, kind) in [
         (GRP_WIRED, NicKind::Wired),
         (GRP_WIRELESS, NicKind::Wireless),
+        (GRP_VPN, NicKind::Vpn),
+        (GRP_VIRTUAL, NicKind::Virtual),
         (GRP_OTHER, NicKind::Other),
     ] {
         let w = wide(kind_name(kind));
@@ -976,12 +982,20 @@ mod tests {
     #[test]
     fn group_ids_match_group_order() {
         use crate::adapterclass::group_order;
-        for k in [NicKind::Wired, NicKind::Wireless, NicKind::Other] {
+        for k in [
+            NicKind::Wired,
+            NicKind::Wireless,
+            NicKind::Vpn,
+            NicKind::Virtual,
+            NicKind::Other,
+        ] {
             assert_eq!(group_of(k), group_order(k) as i32);
         }
         assert_eq!(group_of(NicKind::Wired), 0);
         assert_eq!(group_of(NicKind::Wireless), 1);
-        assert_eq!(group_of(NicKind::Other), 2);
+        assert_eq!(group_of(NicKind::Vpn), 2);
+        assert_eq!(group_of(NicKind::Virtual), 3);
+        assert_eq!(group_of(NicKind::Other), 4);
     }
 
     /// 列宽契约：IPv4/网关 必须装得下 15 字符地址，描述列吃满剩余宽度且不低于下限。
