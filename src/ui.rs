@@ -143,11 +143,11 @@ pub unsafe fn set_columns(hwnd: HWND) {
         return;
     }
     for (i, (name, width)) in [
-        ("状态", 110),
         ("名称", 160),
-        ("描述", 260),
+        ("状态", 110),
         ("IPv4", 120),
         ("网关", 120),
+        ("描述", 260),
     ]
     .iter()
     .enumerate()
@@ -183,12 +183,13 @@ pub unsafe fn populate(hwnd: HWND, nics: &[Nic]) {
     for (row, n) in nics.iter().enumerate() {
         let status = status_text(n);
         let wstat = wide(&status);
+        let name = wide(&n.alias);
         let mut it = LVITEMW {
             mask: LVIF_TEXT | LVIF_GROUPID,
             iItem: row as i32,
             iSubItem: 0,
-            pszText: PWSTR(wstat.as_ptr() as *mut u16),
-            cchTextMax: wstat.len() as i32,
+            pszText: PWSTR(name.as_ptr() as *mut u16),
+            cchTextMax: name.len() as i32,
             // 0.61.3 的 LVITEMW 同时有 iGroupId(v5 语义) 与 iGroup(v6 语义)，
             // 两个都填，避免 comctl32 版本差异导致分组失效
             iGroupId: group_of(n.kind),
@@ -202,11 +203,10 @@ pub unsafe fn populate(hwnd: HWND, nics: &[Nic]) {
             Some(LPARAM(&mut it as *mut LVITEMW as isize)),
         );
 
-        let name = wide(&n.alias);
         let desc = wide(&n.description);
         let ip = wide(&n.ipv4);
         let gw = wide(&n.gateway);
-        for (sub_item, text) in [(1, &name), (2, &desc), (3, &ip), (4, &gw)] {
+        for (sub_item, text) in [(1, &wstat), (2, &ip), (3, &gw), (4, &desc)] {
             let mut sub = LVITEMW {
                 mask: LVIF_TEXT,
                 iItem: row as i32,
@@ -660,7 +660,7 @@ pub unsafe fn on_list_notify(hwnd: HWND, nmh: &mut NMHDR) -> Option<isize> {
         // 用 LVM_GETNEXTITEM 的真实选中行回查，未选中时返回 None。
         let selected = selected_index(list_view(hwnd)) == Some(row);
         let bg = theme::row_bg(selected, row);
-        if cd.iSubItem == 0 {
+        if cd.iSubItem == 1 {
             let (fg, pill_bg, text) = {
                 let guard = lock_state();
                 match guard.nics.get(row) {
@@ -677,7 +677,7 @@ pub unsafe fn on_list_notify(hwnd: HWND, nmh: &mut NMHDR) -> Option<isize> {
         // 名称列深色突出，IPv4/网关浅灰次要；选中行统一深蓝文字
         cd.clrText = if selected {
             theme::SELECT_TEXT
-        } else if cd.iSubItem == 1 {
+        } else if cd.iSubItem == 0 {
             theme::TEXT
         } else {
             theme::TEXT_DIM
