@@ -45,6 +45,15 @@ pub fn status_colors(enabled: bool, connected: bool) -> (COLORREF, COLORREF) {
     }
 }
 
+/// 左侧导航项配色：(背景, 文字, 左侧强调条)。选中浅蓝底深蓝字，未选中白底次强调字。
+pub fn nav_colors(selected: bool) -> (COLORREF, COLORREF, COLORREF) {
+    if selected {
+        (SELECT_BG, SELECT_TEXT, rgb(26, 95, 180))
+    } else {
+        (BG, TEXT_DIM, BG)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +90,17 @@ mod tests {
         assert_ne!(idle.0, live.0);
         // 禁用态即使 connected=true 也必须是灰（enabled 优先）
         assert_eq!(status_colors(false, true), disabled);
+    }
+
+    #[test]
+    fn nav_selected_has_accent_bar_and_distinct_colors() {
+        let on = nav_colors(true);
+        let off = nav_colors(false);
+        assert_ne!(on.0, off.0);
+        assert_ne!(on.1, off.1);
+        assert_eq!(on.0, SELECT_BG);
+        assert_eq!(off.0, BG);
+        assert_eq!(off.2, off.0, "未选中项不应有强调条");
+        assert_ne!(on.2, on.0, "选中项必须有可见的左侧强调条");
     }
 }

@@ -5,24 +5,25 @@ use crate::netctl;
 use crate::netinfo::{self, Nic};
 use crate::theme;
 use crate::winutil::wide;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, FillRect,
-    RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PS_SOLID,
-    TRANSPARENT,
+    InvalidateRect, RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CALCRECT, DT_CENTER,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HFONT,
+    HGDIOBJ, OUT_DEFAULT_PRECIS, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT,
-    CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, ICC_BAR_CLASSES,
-    ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVGF_GROUPID,
-    LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS,
+    CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT,
+    ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
+    LVGF_GROUPID, LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS,
     LVM_ENABLEGROUPVIEW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW,
     LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW,
     LVNI_SELECTED, LVN_ITEMCHANGED, LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW,
@@ -31,12 +32,13 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, GetDlgItem,
-    GetSystemMetrics, GetWindowRect, LoadImageW, MessageBoxW, MoveWindow, SendMessageW,
-    SetWindowLongPtrW, TrackPopupMenu, DWLP_MSGRESULT, ICON_BIG, ICON_SMALL, IDYES, IMAGE_ICON,
-    LR_SHARED, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT, MF_GRAYED,
-    MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, TPM_LEFTALIGN, TPM_TOPALIGN,
-    WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_ERASEBKGND, WM_INITDIALOG,
-    WM_NOTIFY, WM_SETFONT, WM_SETICON, WM_SIZE, WM_SYSCOMMAND,
+    GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadImageW, MessageBoxW, MoveWindow,
+    SendMessageW, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, DWLP_MSGRESULT, ICON_BIG,
+    ICON_SMALL, IDYES, IMAGE_ICON, LR_SHARED, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_SHOW,
+    TPM_LEFTALIGN, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
+    WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_NOTIFY, WM_SETFONT, WM_SETICON, WM_SIZE,
+    WM_SYSCOMMAND,
 };
 
 pub const IDD_MAIN: u32 = 100;
@@ -47,10 +49,129 @@ pub const IDC_DISABLE: u32 = 1002;
 pub const IDC_REFRESH: u32 = 1003;
 pub const IDC_FLUSH_DNS: u32 = 1004;
 pub const IDC_DETAIL: u32 = 1005;
+pub const IDC_RESET: u32 = 1006;
+pub const IDC_CONFIG: u32 = 1007;
+pub const IDC_ROUTE_LIST: u32 = 1010;
+pub const IDC_ROUTE_REFRESH: u32 = 1011;
+pub const IDC_ROUTE_ADD: u32 = 1012;
+pub const IDC_ROUTE_DEL: u32 = 1013;
+pub const IDC_TEST_LABEL: u32 = 1020;
+pub const IDC_TEST_TARGET: u32 = 1021;
+pub const IDC_TEST_KIND: u32 = 1022;
+pub const IDC_TEST_RUN: u32 = 1023;
+pub const IDC_TEST_OUT: u32 = 1024;
 pub const IDC_STATUSBAR: u32 = 3000;
+pub const IDC_NAV_NIC: u32 = 3100;
+pub const IDC_NAV_ROUTE: u32 = 3101;
+pub const IDC_NAV_TEST: u32 = 3102;
 pub const IDM_ENABLE: u32 = 2000;
 pub const IDM_DISABLE: u32 = 2001;
 pub const IDM_DETAIL: u32 = 2002;
+
+/// 左侧竖排导航项，顺序即 `res/app.rc` 中自上而下的顺序。
+pub const NAV_IDS: &[u32] = &[IDC_NAV_NIC, IDC_NAV_ROUTE, IDC_NAV_TEST];
+
+/// 三页导航。每页只显示自己的控件，页与页的控件集合两两不相交。
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Page {
+    Nic,
+    Route,
+    Test,
+}
+
+pub fn nav_of_page(p: Page) -> u32 {
+    match p {
+        Page::Nic => IDC_NAV_NIC,
+        Page::Route => IDC_NAV_ROUTE,
+        Page::Test => IDC_NAV_TEST,
+    }
+}
+
+pub fn page_of_nav(id: u32) -> Option<Page> {
+    match id {
+        IDC_NAV_NIC => Some(Page::Nic),
+        IDC_NAV_ROUTE => Some(Page::Route),
+        IDC_NAV_TEST => Some(Page::Test),
+        _ => None,
+    }
+}
+
+/// 该页工具条控件：一行横排在列表上方。
+pub fn page_toolbar_ids(p: Page) -> &'static [u32] {
+    match p {
+        Page::Nic => &[
+            IDC_ENABLE,
+            IDC_DISABLE,
+            IDC_CONFIG,
+            IDC_DETAIL,
+            IDC_REFRESH,
+            IDC_FLUSH_DNS,
+            IDC_RESET,
+        ],
+        Page::Route => &[IDC_ROUTE_REFRESH, IDC_ROUTE_ADD, IDC_ROUTE_DEL],
+        Page::Test => &[IDC_TEST_LABEL, IDC_TEST_TARGET, IDC_TEST_KIND, IDC_TEST_RUN],
+    }
+}
+
+/// 该页吃满剩余空间的大块控件（列表 / 输出框）。
+pub fn page_fill_ids(p: Page) -> &'static [u32] {
+    match p {
+        Page::Nic => &[IDC_LIST],
+        Page::Route => &[IDC_ROUTE_LIST],
+        Page::Test => &[IDC_TEST_OUT],
+    }
+}
+
+/// 该页的全部控件（切换页面时统一显示/隐藏）。
+pub fn page_ids(p: Page) -> &'static [u32] {
+    match p {
+        Page::Nic => &[
+            IDC_ENABLE,
+            IDC_DISABLE,
+            IDC_CONFIG,
+            IDC_DETAIL,
+            IDC_REFRESH,
+            IDC_FLUSH_DNS,
+            IDC_RESET,
+            IDC_LIST,
+        ],
+        Page::Route => &[
+            IDC_ROUTE_REFRESH,
+            IDC_ROUTE_ADD,
+            IDC_ROUTE_DEL,
+            IDC_ROUTE_LIST,
+        ],
+        Page::Test => &[
+            IDC_TEST_LABEL,
+            IDC_TEST_TARGET,
+            IDC_TEST_KIND,
+            IDC_TEST_RUN,
+            IDC_TEST_OUT,
+        ],
+    }
+}
+
+/// 当前页面。对话框只有一条 UI 线程，AtomicU32 足够，也省掉一个 Mutex。
+static CURRENT_PAGE: AtomicU32 = AtomicU32::new(0);
+
+pub fn current_page() -> Page {
+    match CURRENT_PAGE.load(Ordering::Relaxed) {
+        1 => Page::Route,
+        2 => Page::Test,
+        _ => Page::Nic,
+    }
+}
+
+pub fn set_current_page(p: Page) {
+    CURRENT_PAGE.store(
+        match p {
+            Page::Nic => 0,
+            Page::Route => 1,
+            Page::Test => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
 
 pub const GRP_WIRED: i32 = 0;
 pub const GRP_WIRELESS: i32 = 1;
@@ -67,10 +188,44 @@ const COL_GW: i32 = 148;
 const COL_DESC_MIN: i32 = 160;
 const COL_DESC_INDEX: i32 = 4;
 
+/// 列表与窗口边缘、列表与左侧菜单列之间的间距（px）。
+const LIST_MARGIN: i32 = 5;
+
 /// 描述列宽度：列表客户区减去四列固定宽度。
 pub fn desc_column_width(list_client_w: i32) -> i32 {
     // 额外留 2px 给主题边框与取整，否则算得刚好时会冒出横向滚动条
     (list_client_w - (COL_NAME + COL_STATUS + COL_IP + COL_GW) - 2).max(COL_DESC_MIN)
+}
+
+/// 菜单列右边界：取最宽按钮，且不小于 `fallback`。
+/// 一个都没量到时（控件尚未创建/查询失败）必须退回 fallback，否则列表会盖住整列按钮。
+pub fn nav_right(edges: &[i32], fallback: i32) -> i32 {
+    edges
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(fallback)
+        .max(fallback)
+}
+
+/// 列表矩形 (x, y, w, h)：导航列右侧、工具条下方、状态栏上方。宽高夹到 0 ——
+/// MoveWindow 收到负值不会报错，只会画出一个不可见的控件，看起来像「窗口拉小后列表消失了」。
+pub fn list_bounds(
+    client_w: i32,
+    client_h: i32,
+    nav_right: i32,
+    top: i32,
+    sb_height: i32,
+    margin: i32,
+) -> (i32, i32, i32, i32) {
+    let x = nav_right + margin;
+    let y = top;
+    (
+        x,
+        y,
+        (client_w - x - margin).max(0),
+        (client_h - y - sb_height - margin).max(0),
+    )
 }
 
 /// 数字资源 ID 的 MAKEINTRESOURCE 等价写法。
@@ -570,6 +725,39 @@ fn trim_working_set() {
     }
 }
 
+/// 导航项整块自绘：底色 + 左侧强调条 + 居中文字。
+///
+/// # Safety
+/// `dis` 来自 WM_DRAWITEM，`hDC` 与 `rcItem` 由系统填好。
+unsafe fn draw_nav_item(dis: &DRAWITEMSTRUCT) {
+    let selected = page_of_nav(dis.CtlID) == Some(current_page());
+    let (bg, fg, accent) = theme::nav_colors(selected);
+    let brush = CreateSolidBrush(bg);
+    FillRect(dis.hDC, &dis.rcItem, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+    if selected {
+        let mut bar = dis.rcItem;
+        bar.right = bar.left + 3;
+        let b = CreateSolidBrush(accent);
+        FillRect(dis.hDC, &bar, b);
+        let _ = DeleteObject(HGDIOBJ(b.0));
+    }
+    let mut buf = [0u16; 64];
+    let n = GetWindowTextW(dis.hwndItem, &mut buf);
+    let text = String::from_utf16_lossy(&buf[..n as usize]);
+    let mut t = wide(&text);
+    let len = t.len() - 1;
+    let mut r = dis.rcItem;
+    let _ = SetBkMode(dis.hDC, TRANSPARENT);
+    let _ = SetTextColor(dis.hDC, fg);
+    DrawTextW(
+        dis.hDC,
+        &mut t[..len],
+        &mut r,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
 /// 自绘状态胶囊：圆角底色 + 同色圆点 + 文字。返回 CDRF_SKIPDEFAULT 后本格背景须自己填。
 ///
 /// # Safety
@@ -709,8 +897,58 @@ pub unsafe fn on_list_notify(hwnd: HWND, nmh: &mut NMHDR) -> Option<isize> {
     None
 }
 
-/// 窗口缩放时让列表与状态栏跟随。
-/// 列表顶边不写死像素：从「刷新」按钮的实际底边推出来，这样任意 DPI 下都不会压到按钮。
+/// 只显示目标页面的控件。模板不负责可见性，这里是唯一真相。
+///
+/// # Safety
+/// `hwnd` 是主对话框；缺失的控件会被 `GetDlgItem` 过滤掉，不会崩。
+pub unsafe fn apply_page(hwnd: HWND, page: Page) {
+    for p in [Page::Nic, Page::Route, Page::Test] {
+        let show = if p == page { SW_SHOW } else { SW_HIDE };
+        for id in page_ids(p) {
+            if let Ok(h) = GetDlgItem(Some(hwnd), *id as i32) {
+                let _ = ShowWindow(h, show);
+            }
+        }
+    }
+    set_current_page(page);
+    for id in NAV_IDS {
+        if let Ok(h) = GetDlgItem(Some(hwnd), *id as i32) {
+            let _ = InvalidateRect(Some(h), None, true);
+        }
+    }
+    layout(hwnd);
+}
+
+/// 工具条底边 = 该页所有工具条控件客户区底边的最大值 + 6px。
+/// 取最大值而不是「第一个控件」：测试页第一个控件是静态标签，比同行按钮矮。
+/// 一个都量不到时返回 `None`，由调用方退回模板顶边 —— 绝不把列表挪到控件上面。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+unsafe fn toolbar_bottom(hwnd: HWND, page: Page) -> Option<i32> {
+    let mut bottom: Option<i32> = None;
+    for id in page_toolbar_ids(page) {
+        let Ok(ctl) = GetDlgItem(Some(hwnd), *id as i32) else {
+            continue;
+        };
+        let mut r = RECT::default();
+        if GetWindowRect(ctl, &mut r).is_err() {
+            continue;
+        }
+        let mut pt = POINT {
+            x: r.left,
+            y: r.bottom,
+        };
+        if !ScreenToClient(hwnd, &mut pt).as_bool() {
+            continue;
+        }
+        bottom = Some(bottom.map_or(pt.y, |b: i32| b.max(pt.y)));
+    }
+    bottom.map(|y| y + 6)
+}
+
+/// 窗口缩放时让大块控件跟随：导航列右侧、本页工具条下方、状态栏上方。
+/// 导航列宽不写死像素：从导航按钮的实际右边界量出来，任意 DPI 下都贴合。
 ///
 /// # Safety
 /// `hwnd` 是主对话框。
@@ -719,20 +957,7 @@ pub unsafe fn layout(hwnd: HWND) {
     if GetClientRect(hwnd, &mut rc).is_err() {
         return;
     }
-    let mut top = 24;
-    let btn = GetDlgItem(Some(hwnd), IDC_REFRESH as i32).unwrap_or_default();
-    if !btn.is_invalid() {
-        let mut br = RECT::default();
-        if GetWindowRect(btn, &mut br).is_ok() {
-            let mut pt = POINT {
-                x: br.left,
-                y: br.bottom,
-            };
-            if ScreenToClient(hwnd, &mut pt).as_bool() {
-                top = pt.y + 6;
-            }
-        }
-    }
+    let page = current_page();
 
     let sb = status_bar(hwnd);
     let mut sb_height = 0;
@@ -745,15 +970,61 @@ pub unsafe fn layout(hwnd: HWND) {
         }
     }
 
-    let hl = list_view(hwnd);
-    if hl.is_invalid() {
-        return;
+    let nav = menu_right_edge(hwnd, list_view(hwnd));
+    let top = toolbar_bottom(hwnd, page).unwrap_or(24);
+    let (x, y, w, h) = list_bounds(
+        rc.right - rc.left,
+        rc.bottom - rc.top,
+        nav,
+        top,
+        sb_height,
+        LIST_MARGIN,
+    );
+    for id in page_fill_ids(page) {
+        if let Ok(hctl) = GetDlgItem(Some(hwnd), *id as i32) {
+            let _ = MoveWindow(hctl, x, y, w, h, true);
+        }
     }
-    let margin = 5;
-    let width = (rc.right - rc.left - margin * 2).max(0);
-    let height = (rc.bottom - rc.top - top - sb_height - margin).max(0);
-    let _ = MoveWindow(hl, margin, top, width, height, true);
-    fit_description_column(hl);
+    if page == Page::Nic {
+        fit_description_column(list_view(hwnd));
+    }
+}
+
+/// 左侧菜单列的右边界（客户区 px）。量不到任何按钮时退回列表当前的左边距，
+/// 也就是「让它待在模板位置」，而不是把列表挪到 x=margin 盖住按钮。
+///
+/// # Safety
+/// `hwnd` 是主对话框，`hl` 是其列表控件。
+unsafe fn menu_right_edge(hwnd: HWND, hl: HWND) -> i32 {
+    let mut edges: Vec<i32> = Vec::with_capacity(NAV_IDS.len());
+    for id in NAV_IDS {
+        let btn = GetDlgItem(Some(hwnd), *id as i32).unwrap_or_default();
+        if btn.is_invalid() {
+            continue;
+        }
+        let mut br = RECT::default();
+        if GetWindowRect(btn, &mut br).is_ok() {
+            let mut pt = POINT {
+                x: br.right,
+                y: br.top,
+            };
+            if ScreenToClient(hwnd, &mut pt).as_bool() {
+                edges.push(pt.x);
+            }
+        }
+    }
+    let mut fallback = 0;
+    let mut lr = RECT::default();
+    if GetWindowRect(hl, &mut lr).is_ok() {
+        let mut pt = POINT {
+            x: lr.left,
+            y: lr.top,
+        };
+        if ScreenToClient(hwnd, &mut pt).as_bool() {
+            fallback = (pt.x - LIST_MARGIN).max(0);
+        }
+    }
+    nav_right(&edges, fallback)
 }
 
 /// 描述列跟着窗口宽度伸缩（窗口可拖拽），避免固定宽度被视口硬裁。
@@ -811,9 +1082,18 @@ pub unsafe extern "system" fn main_dlgproc(
             ensure_groups(hwnd);
             init_status_bar(hwnd);
             refresh_list(hwnd);
-            layout(hwnd);
             sync_buttons(hwnd, list_view(hwnd));
+            apply_page(hwnd, Page::Nic);
             1
+        }
+        WM_DRAWITEM => {
+            let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            if NAV_IDS.contains(&dis.CtlID) {
+                draw_nav_item(dis);
+                1
+            } else {
+                0
+            }
         }
         // 主窗口与详情统一白底：直接在擦除阶段填白（WM_CTLCOLORDLG 在对话框过程里被忽略过）。
         WM_ERASEBKGND => {
@@ -827,8 +1107,13 @@ pub unsafe extern "system" fn main_dlgproc(
             1
         }
         WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u32;
+            if let Some(page) = page_of_nav(id) {
+                apply_page(hwnd, page);
+                return 1;
+            }
             let hl = list_view(hwnd);
-            match (wparam.0 & 0xFFFF) as u32 {
+            match id {
                 IDC_REFRESH => {
                     refresh_list(hwnd);
                     sync_buttons(hwnd, hl);
@@ -1030,6 +1315,21 @@ mod tests {
             ("IDC_DISABLE", IDC_DISABLE),
             ("IDC_REFRESH", IDC_REFRESH),
             ("IDC_FLUSH_DNS", IDC_FLUSH_DNS),
+            ("IDC_DETAIL", IDC_DETAIL),
+            ("IDC_RESET", IDC_RESET),
+            ("IDC_CONFIG", IDC_CONFIG),
+            ("IDC_ROUTE_LIST", IDC_ROUTE_LIST),
+            ("IDC_ROUTE_REFRESH", IDC_ROUTE_REFRESH),
+            ("IDC_ROUTE_ADD", IDC_ROUTE_ADD),
+            ("IDC_ROUTE_DEL", IDC_ROUTE_DEL),
+            ("IDC_TEST_LABEL", IDC_TEST_LABEL),
+            ("IDC_TEST_TARGET", IDC_TEST_TARGET),
+            ("IDC_TEST_KIND", IDC_TEST_KIND),
+            ("IDC_TEST_RUN", IDC_TEST_RUN),
+            ("IDC_TEST_OUT", IDC_TEST_OUT),
+            ("IDC_NAV_NIC", IDC_NAV_NIC),
+            ("IDC_NAV_ROUTE", IDC_NAV_ROUTE),
+            ("IDC_NAV_TEST", IDC_NAV_TEST),
             ("IDM_ENABLE", IDM_ENABLE),
             ("IDM_DISABLE", IDM_DISABLE),
             ("IDM_DETAIL", IDM_DETAIL),
@@ -1053,5 +1353,254 @@ mod tests {
     fn resource_id_is_makeintresource() {
         assert_eq!(resource_id(100).0 as usize, 100);
         assert_eq!(resource_id(0).0 as usize, 0);
+    }
+
+    /// 模板里的一个控件矩形（DLU）。
+    #[derive(Copy, Clone)]
+    struct TRect {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    }
+
+    /// IDD_MAIN 模板解析结果。
+    struct Template {
+        buttons: Vec<(u32, TRect)>,
+        list: TRect,
+        width: i32,
+    }
+
+    /// 模板里所有按钮的 (ID, 符号名)。加按钮必须同步登记，否则解析时直接 panic。
+    const BUTTON_NAMES: &[(u32, &str)] = &[
+        (IDC_NAV_NIC, "IDC_NAV_NIC"),
+        (IDC_NAV_ROUTE, "IDC_NAV_ROUTE"),
+        (IDC_NAV_TEST, "IDC_NAV_TEST"),
+        (IDC_ENABLE, "IDC_ENABLE"),
+        (IDC_DISABLE, "IDC_DISABLE"),
+        (IDC_CONFIG, "IDC_CONFIG"),
+        (IDC_DETAIL, "IDC_DETAIL"),
+        (IDC_REFRESH, "IDC_REFRESH"),
+        (IDC_FLUSH_DNS, "IDC_FLUSH_DNS"),
+        (IDC_RESET, "IDC_RESET"),
+        (IDC_ROUTE_REFRESH, "IDC_ROUTE_REFRESH"),
+        (IDC_ROUTE_ADD, "IDC_ROUTE_ADD"),
+        (IDC_ROUTE_DEL, "IDC_ROUTE_DEL"),
+        (IDC_TEST_RUN, "IDC_TEST_RUN"),
+    ];
+
+    /// 控件 ID → .rc 里的符号名。
+    fn id_name(id: u32) -> &'static str {
+        const OTHER: &[(u32, &str)] = &[
+            (IDC_LIST, "IDC_LIST"),
+            (IDC_ROUTE_LIST, "IDC_ROUTE_LIST"),
+            (IDC_TEST_LABEL, "IDC_TEST_LABEL"),
+            (IDC_TEST_TARGET, "IDC_TEST_TARGET"),
+            (IDC_TEST_KIND, "IDC_TEST_KIND"),
+            (IDC_TEST_OUT, "IDC_TEST_OUT"),
+        ];
+        BUTTON_NAMES
+            .iter()
+            .chain(OTHER)
+            .find(|(i, _)| *i == id)
+            .map(|(_, name)| *name)
+            .unwrap_or_else(|| panic!("未登记的控件 {id}"))
+    }
+
+    /// 解析 IDD_MAIN 模板。
+    ///
+    /// 位置有两套真相 —— `.rc` 模板和 `layout()` 的运行时 MoveWindow。`.rc` 写歪了
+    /// 不会被任何 Rust 代码感知（运行时会被纠正成「看起来对」的布局），模板改回横向一排
+    /// 也照样跑得起来，所以这里直接拿模板文本当契约来钉。
+    fn main_dialog_template() -> Template {
+        let mut buttons = Vec::new();
+        let mut list = TRect {
+            x: -1,
+            y: -1,
+            w: -1,
+            h: -1,
+        };
+        let mut width = 0;
+        for stmt in dialog_statements("IDD_MAIN") {
+            if stmt.starts_with("IDD_MAIN DIALOGEX") {
+                // IDD_MAIN DIALOGEX 0, 0, 620, 380
+                width = numbers(&stmt)[2];
+            } else if stmt.starts_with("PUSHBUTTON") {
+                let id = BUTTON_NAMES
+                    .iter()
+                    .find(|(_, name)| stmt.contains(name))
+                    .map(|(id, _)| *id)
+                    .unwrap_or_else(|| panic!("按钮不在 BUTTON_NAMES 里：{stmt}"));
+                buttons.push((id, geometry(&stmt)));
+            } else if stmt.contains("IDC_LIST") {
+                list = geometry(&stmt);
+            }
+        }
+        Template {
+            buttons,
+            list,
+            width,
+        }
+    }
+
+    /// 语句末尾的四个数字就是 x, y, w, h（标签里出现数字也不会串位）。
+    fn geometry(statement: &str) -> TRect {
+        let nums = numbers(statement);
+        let n = nums.len();
+        assert!(n >= 4, "语句里没有几何数字：{statement}");
+        TRect {
+            x: nums[n - 4],
+            y: nums[n - 3],
+            w: nums[n - 2],
+            h: nums[n - 1],
+        }
+    }
+
+    /// 把 `name` 这个 DIALOGEX 块拆成逻辑语句（含模板头行）。rc 里一条控件语句可以跨行写
+    /// （以逗号结尾），逐行读会把几何数字落到下一条「语句」里。
+    fn dialog_statements(name: &str) -> Vec<String> {
+        let rc = include_str!("../res/app.rc");
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut inside = false;
+        for line in rc.lines() {
+            let t = line.trim();
+            if !inside {
+                inside = t.starts_with(name);
+                if !inside {
+                    continue;
+                }
+            }
+            if t == "END" {
+                break;
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(t);
+            if !t.ends_with(',') {
+                out.push(std::mem::take(&mut current));
+            }
+        }
+        assert!(!out.is_empty(), "{name} 模板没解析出任何语句");
+        out
+    }
+
+    fn numbers(text: &str) -> Vec<i32> {
+        text.replace(',', " ")
+            .split_whitespace()
+            .filter_map(|w| w.parse().ok())
+            .collect()
+    }
+
+    /// 三个页面必须两两不相交，且每个 ID 都在 .rc 模板里真实存在。
+    #[test]
+    fn page_ids_are_disjoint_and_present_in_template() {
+        use std::collections::HashSet;
+        let rc = include_str!("../res/app.rc");
+        let mut seen = HashSet::new();
+        for p in [Page::Nic, Page::Route, Page::Test] {
+            for id in page_ids(p) {
+                assert!(seen.insert(*id), "控件 {id} 被两个页面同时声明");
+            }
+            for id in page_ids(p) {
+                assert!(
+                    rc.contains(id_name(*id)),
+                    "页面 {:?} 的控件 {id} 不在 res/app.rc 里",
+                    p
+                );
+            }
+        }
+        // 导航项不属于任何页面（永远可见）
+        for id in NAV_IDS {
+            assert!(!seen.contains(id), "导航项 {id} 不能混进页面控件");
+        }
+    }
+
+    /// 大块区域控件必须包含在该页面的全部控件里，否则切换页面会留下没被隐藏的空框。
+    #[test]
+    fn fill_controls_belong_to_their_page() {
+        for p in [Page::Nic, Page::Route, Page::Test] {
+            for id in page_fill_ids(p) {
+                assert!(page_ids(p).contains(id), "{id} 不在页面 {:?} 的全集里", p);
+            }
+        }
+        assert_eq!(page_fill_ids(Page::Nic), &[IDC_LIST]);
+        assert_eq!(page_fill_ids(Page::Route), &[IDC_ROUTE_LIST]);
+        assert_eq!(page_fill_ids(Page::Test), &[IDC_TEST_OUT]);
+    }
+
+    #[test]
+    fn nav_ids_round_trip() {
+        assert_eq!(page_of_nav(nav_of_page(Page::Nic)), Some(Page::Nic));
+        assert_eq!(page_of_nav(nav_of_page(Page::Route)), Some(Page::Route));
+        assert_eq!(page_of_nav(nav_of_page(Page::Test)), Some(Page::Test));
+        assert_eq!(page_of_nav(IDC_LIST), None);
+        // 三个导航项互不相同，否则点一个会选中两个
+        let ids: Vec<u32> = [Page::Nic, Page::Route, Page::Test]
+            .into_iter()
+            .map(nav_of_page)
+            .collect();
+        let uniq: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        assert_eq!(uniq.len(), 3);
+    }
+
+    /// 导航是左侧一竖列，工具条是右侧一横行 —— 两者都不许混。
+    #[test]
+    fn nav_is_vertical_and_toolbar_is_horizontal() {
+        let t = main_dialog_template();
+        let nav: Vec<TRect> = t
+            .buttons
+            .iter()
+            .filter(|(id, _)| NAV_IDS.contains(id))
+            .map(|(_, r)| *r)
+            .collect();
+        assert_eq!(nav.len(), 3);
+        for i in 1..nav.len() {
+            let r = nav[i];
+            assert_eq!(r.x, nav[0].x, "导航项必须同列");
+            assert!(
+                r.y >= nav[i - 1].y + nav[i - 1].h,
+                "导航项垂直重叠：y {} 压在 {} 上",
+                r.y,
+                nav[i - 1].y
+            );
+        }
+        let toolbar: Vec<TRect> = t
+            .buttons
+            .iter()
+            .filter(|(id, _)| page_toolbar_ids(Page::Nic).contains(id))
+            .map(|(_, r)| *r)
+            .collect();
+        assert_eq!(toolbar.len(), page_toolbar_ids(Page::Nic).len());
+        for r in &toolbar[1..] {
+            assert_eq!(r.y, toolbar[0].y, "工具条必须同一行");
+            assert!(r.x > toolbar[0].x, "工具条必须自左向右");
+        }
+        // 工具条整体在导航列右侧
+        let nav_right = nav.iter().map(|r| r.x + r.w).max().unwrap();
+        assert!(toolbar.iter().all(|r| r.x >= nav_right));
+        // 导航列不占右半窗，且列表初始矩形也在它右侧
+        assert!(nav_right < t.width / 2, "导航列宽 {nav_right} 超过半窗");
+        assert!(
+            toolbar.iter().all(|r| r.x + r.w <= t.width),
+            "工具条超出窗口"
+        );
+        assert!(t.list.x >= nav_right, "列表初始位置压在导航列上");
+    }
+
+    /// 菜单列右边界取最宽按钮；一个控件都没量到时退回兜底宽度，不能让列表盖住菜单。
+    #[test]
+    fn nav_right_uses_widest_button_and_never_shrinks_below_fallback() {
+        assert_eq!(nav_right(&[80, 96, 74], 60), 96);
+        assert_eq!(nav_right(&[70], 100), 100);
+        assert_eq!(nav_right(&[], 100), 100);
+    }
+
+    /// 列表矩形：导航右侧、工具条下方、状态栏上方；极小窗口夹到 0，负宽高会让控件直接不画。
+    #[test]
+    fn list_sits_right_of_menu_and_above_statusbar() {
+        assert_eq!(list_bounds(900, 600, 140, 40, 22, 5), (145, 40, 750, 533));
+        assert_eq!(list_bounds(100, 30, 140, 40, 22, 5), (145, 40, 0, 0));
     }
 }
