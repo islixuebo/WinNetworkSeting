@@ -1,11 +1,11 @@
 // Task 5：主窗口 —— 分组 ListView、状态栏、状态列着色、缩放跟随。
 // 资源 ID 的单一来源在本模块（res/resource.h 是 rc 侧的单一来源，两边数值必须一致）。
 use crate::adapterclass::{kind_name, NicKind};
-use crate::netctl;
+use crate::netctl::{self, TestKind, TestResult};
 use crate::netinfo::{self, Nic, Route};
 use crate::theme;
 use crate::winutil::wide;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, POINT, RECT, WPARAM};
@@ -34,10 +34,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, GetDlgItem,
     GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadImageW, MessageBoxW, MoveWindow,
-    SendMessageW, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, DWLP_MSGRESULT, ICON_BIG,
-    ICON_SMALL, IDYES, IMAGE_ICON, LR_SHARED, MB_ICONERROR, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
-    MB_YESNO, MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, SW_HIDE,
-    SW_SHOW, TPM_LEFTALIGN, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND,
+    PostMessageW, SendMessageW, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, CB_ADDSTRING,
+    CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE, DWLP_MSGRESULT, ICON_BIG, ICON_SMALL, IDYES,
+    IMAGE_ICON, LR_SHARED, MB_ICONERROR, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, SW_HIDE,
+    SW_SHOW, TPM_LEFTALIGN, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_APP, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_NOTIFY, WM_SETFONT, WM_SETICON,
     WM_SIZE, WM_SYSCOMMAND,
 };
@@ -931,6 +932,129 @@ pub unsafe fn on_flush_dns(hwnd: HWND) {
     }
 }
 
+/// 目标参数校验：不经过 shell，所以不存在注入；但仍拒绝空白与元字符，
+/// 免得把错参数喂给 ping 之后只得到一句看不懂的用法提示。
+pub fn valid_target(kind: TestKind, target: &str) -> Result<(), String> {
+    if kind == TestKind::IpConfig {
+        return Ok(());
+    }
+    let t = target.trim();
+    if t.is_empty() {
+        return Err("请输入目标地址或域名".into());
+    }
+    if t.len() > 255 {
+        return Err("目标过长".into());
+    }
+    if t.chars().any(|c| c.is_whitespace() || "&|;<>\"'".contains(c)) {
+        return Err("目标不能包含空格或特殊字符".into());
+    }
+    Ok(())
+}
+
+pub fn test_report(kind: TestKind, target: &str, r: &TestResult) -> String {
+    let head = if kind == TestKind::IpConfig {
+        format!("=== {} === {}", netctl::test_kind_name(kind), r.summary())
+    } else {
+        format!(
+            "=== {} {} === {}",
+            netctl::test_kind_name(kind),
+            target,
+            r.summary()
+        )
+    };
+    format!("{head}\r\n{}\r\n", r.text)
+}
+
+static TEST_BUSY: AtomicBool = AtomicBool::new(false);
+pub const WM_TEST_DONE: u32 = WM_APP + 1;
+
+/// 在工作线程跑测试，完成后 PostMessage 回填。UI 线程一秒都不能等：
+/// tracert 单次就能跑十几秒。
+///
+/// # Safety
+/// `hwnd` 是主对话框，且在下一次 `WM_TEST_DONE` 之前不能销毁（模态框这一条天然成立）。
+pub unsafe fn on_test_run(hwnd: HWND) {
+    if TEST_BUSY.swap(true, Ordering::SeqCst) {
+        set_status(hwnd, "上一次测试还在进行");
+        return;
+    }
+    let kind = current_test_kind(hwnd);
+    let target = crate::forms::read_edit(hwnd, IDC_TEST_TARGET);
+    if let Err(e) = valid_target(kind, &target) {
+        TEST_BUSY.store(false, Ordering::SeqCst);
+        set_status(hwnd, &e);
+        return;
+    }
+    crate::forms::edit_text(
+        hwnd,
+        IDC_TEST_OUT,
+        &format!("正在执行 {} …\r\n", netctl::test_kind_name(kind)),
+    );
+    set_control_enabled(hwnd, IDC_TEST_RUN, false);
+
+    let h = hwnd.0 as usize;
+    let t = target.trim().to_string();
+    std::thread::spawn(move || {
+        let result = netctl::run_test(kind, &t);
+        let report = test_report(kind, &t, &result);
+        let payload = Box::into_raw(Box::new(report));
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(h as *mut core::ffi::c_void)),
+                WM_TEST_DONE,
+                WPARAM(0),
+                LPARAM(payload as isize),
+            );
+        }
+    });
+}
+
+/// # Safety
+/// `hwnd` 是主对话框，且测试页下拉框已创建。
+pub unsafe fn current_test_kind(hwnd: HWND) -> TestKind {
+    let h = GetDlgItem(Some(hwnd), IDC_TEST_KIND as i32).unwrap_or_default();
+    let sel = SendMessageW(h, CB_GETCURSEL, None, None).0 as usize;
+    match sel {
+        1 => TestKind::Tracert,
+        2 => TestKind::Nslookup,
+        3 => TestKind::IpConfig,
+        _ => TestKind::Ping,
+    }
+}
+
+/// # Safety
+/// `hwnd` 是主对话框；`id` 对应的控件不存在时静默忽略。
+pub unsafe fn set_control_enabled(hwnd: HWND, id: u32, on: bool) {
+    if let Ok(h) = GetDlgItem(Some(hwnd), id as i32) {
+        let _ = EnableWindow(h, on);
+    }
+}
+
+unsafe fn init_test_kind(hwnd: HWND) {
+    let h = GetDlgItem(Some(hwnd), IDC_TEST_KIND as i32).unwrap_or_default();
+    if h.is_invalid() {
+        return;
+    }
+    for kind in [
+        TestKind::Ping,
+        TestKind::Tracert,
+        TestKind::Nslookup,
+        TestKind::IpConfig,
+    ] {
+        let t = wide(netctl::test_kind_name(kind));
+        let _ = SendMessageW(h, CB_ADDSTRING, None, Some(LPARAM(t.as_ptr() as isize)));
+    }
+    let _ = SendMessageW(h, CB_SETCURSEL, Some(WPARAM(0)), None);
+}
+
+/// 选到 Ipconfig 时目标框无意义，直接禁用。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn on_test_kind_changed(hwnd: HWND) {
+    set_control_enabled(hwnd, IDC_TEST_TARGET, current_test_kind(hwnd) != TestKind::IpConfig);
+}
+
 /// 删除默认路由前的断网告警；其它路由返回空串。
 pub fn route_delete_warning(prefix: &str) -> &'static str {
     if crate::validate::is_default_prefix(prefix) {
@@ -1568,6 +1692,7 @@ pub unsafe extern "system" fn main_dlgproc(
             set_route_columns(hwnd);
             ensure_groups(hwnd);
             init_status_bar(hwnd);
+            init_test_kind(hwnd);
             refresh_list(hwnd);
             sync_buttons(hwnd, list_view(hwnd));
             apply_page(hwnd, Page::Nic);
@@ -1595,6 +1720,7 @@ pub unsafe extern "system" fn main_dlgproc(
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u32;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             if let Some(page) = page_of_nav(id) {
                 apply_page(hwnd, page);
                 return 1;
@@ -1617,8 +1743,19 @@ pub unsafe extern "system" fn main_dlgproc(
                 IDC_ROUTE_REFRESH => refresh_routes(hwnd),
                 IDC_ROUTE_ADD => on_route_add(hwnd),
                 IDC_ROUTE_DEL => on_route_delete(hwnd),
+                IDC_TEST_RUN => on_test_run(hwnd),
+                IDC_TEST_KIND if code == CBN_SELCHANGE => on_test_kind_changed(hwnd),
                 _ => return 0,
             }
+            1
+        }
+        WM_TEST_DONE => {
+            // 所有权移交：Box 在工作线程里 into_raw，这里唯一一次 from_raw。
+            let report = *Box::from_raw(lparam.0 as *mut String);
+            TEST_BUSY.store(false, Ordering::SeqCst);
+            set_control_enabled(hwnd, IDC_TEST_RUN, true);
+            crate::forms::edit_text(hwnd, IDC_TEST_OUT, &report);
+            set_status(hwnd, "测试完成");
             1
         }
         WM_CONTEXTMENU => {
@@ -2185,5 +2322,24 @@ mod tests {
     fn list_sits_right_of_menu_and_above_statusbar() {
         assert_eq!(list_bounds(900, 600, 140, 40, 22, 5), (145, 40, 750, 533));
         assert_eq!(list_bounds(100, 30, 140, 40, 22, 5), (145, 40, 0, 0));
+    }
+
+    #[test]
+    fn target_validation_requires_input_except_for_ipconfig() {
+        assert!(valid_target(TestKind::Ping, "10.0.0.1").is_ok());
+        assert!(valid_target(TestKind::Ping, "  ").is_err());
+        assert!(valid_target(TestKind::Ping, "10.0.0.1 & del x").is_err(), "不许带 shell 元字符");
+        assert!(valid_target(TestKind::Nslookup, "example.com").is_ok());
+        assert!(valid_target(TestKind::IpConfig, "").is_ok());
+    }
+
+    /// 报告头必须包含命令与结果摘要，否则用户不知道这段输出来自哪次测试。
+    #[test]
+    fn report_header_has_kind_target_and_summary() {
+        let r = TestResult { text: "Pinging 10.0.0.1".into(), code: Some(0) };
+        let s = test_report(TestKind::Ping, "10.0.0.1", &r);
+        assert!(s.contains("Ping 10.0.0.1"), "{s}");
+        assert!(s.contains("完成"), "{s}");
+        assert!(s.contains("Pinging 10.0.0.1"), "{s}");
     }
 }
