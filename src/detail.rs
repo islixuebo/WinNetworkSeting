@@ -6,7 +6,7 @@
 //! 窗口高度按「客户区期望 + 实测非客户区」算，不再猜标题栏像素，避免末行被裁。
 
 use crate::adapterclass::kind_name;
-use crate::netinfo::Nic;
+use crate::netinfo::{metric_display, Nic};
 use crate::theme;
 use crate::winutil::wide;
 use std::cell::RefCell;
@@ -71,11 +71,7 @@ pub fn build_rows(n: &Nic) -> Vec<(&'static str, String)> {
         ("速率", dash(&n.speed)),
         (
             "接口跃点数",
-            if n.metric == 0 {
-                "自动/未知".to_string()
-            } else {
-                n.metric.to_string()
-            },
+            metric_display(n.metric, n.metric_auto),
         ),
         (
             "默认路由",
@@ -320,8 +316,10 @@ mod tests {
         n.connected = true;
         assert_eq!(build_rows(&n)[1].1, "已启用·已连接");
         n.metric = 0;
-        assert_eq!(build_rows(&n)[9].1, "自动/未知");
+        assert_eq!(build_rows(&n)[9].1, "自动");
         n.metric = 25;
+        assert_eq!(build_rows(&n)[9].1, "自动（25）");
+        n.metric_auto = false;
         assert_eq!(build_rows(&n)[9].1, "25");
     }
 

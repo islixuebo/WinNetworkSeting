@@ -22,19 +22,46 @@ pub fn netsh_args_for(alias: &str, enable: bool) -> Vec<String> {
 
 /// CIM 通道参数。用 `-InterfaceIndex` 而不是名字：ifIndex 是采集时拿到的结构化标识，
 /// 不受本地化别名与 netsh 名单影响。`-NonInteractive` 是硬要求 —— UI 线程同步等待子进程，
-/// 任何确认提示都会把窗口冻住。前置 UTF-8 输出编码，否则中文 Windows 下的错误行是 GBK，
-/// `failure_text` 会判为不可解码而丢掉唯一的原因线索。
+/// 任何确认提示都会把窗口冻住。
 pub fn netadapter_args_for(if_index: u32, enable: bool) -> Vec<String> {
     let verb = if enable { "Enable" } else { "Disable" };
+    ps_args(&format!(
+        "{verb}-NetAdapter -InterfaceIndex {if_index} -Confirm:$False"
+    ))
+}
+
+/// PowerShell 单命令参数：前置 UTF-8 输出编码，否则中文 Windows 下的错误行是 GBK，
+/// `failure_text` 会判为不可解码而丢掉唯一的原因线索。
+fn ps_args(command: &str) -> Vec<String> {
     vec![
         "-NoProfile".into(),
         "-NonInteractive".into(),
         "-Command".into(),
-        format!(
-            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
-             {verb}-NetAdapter -InterfaceIndex {if_index} -Confirm:$False"
-        ),
+        format!("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {command}"),
     ]
+}
+
+/// 手动跃点：写数值的同时必须关掉「自动」，否则 Windows 会继续按链路速率算。
+/// 走 CIM 而不是 `SetIpInterfaceEntry`：后者只改运行时值，重启回退。
+pub fn set_metric_args(if_index: u32, metric: u32) -> Vec<String> {
+    ps_args(&format!(
+        "Set-NetIPInterface -InterfaceIndex {if_index} -InterfaceMetric {metric} -AutomaticMetric Disabled -Confirm:$False"
+    ))
+}
+
+/// 恢复自动：只把开关打开，数值交给系统。
+pub fn set_metric_auto_args(if_index: u32) -> Vec<String> {
+    ps_args(&format!(
+        "Set-NetIPInterface -InterfaceIndex {if_index} -AutomaticMetric Enabled -Confirm:$False"
+    ))
+}
+
+/// `None` = 自动。两条路径都写进注册表，刷新后 `GetIpInterfaceEntry` 能读回。
+pub fn apply_metric(if_index: u32, metric: Option<u32>) -> Result<(), String> {
+    match metric {
+        Some(m) => run_netadapter(&set_metric_args(if_index, m)),
+        None => run_netadapter(&set_metric_auto_args(if_index)),
+    }
 }
 
 pub fn run_netsh(args: &[String]) -> Result<(), String> {
@@ -155,6 +182,31 @@ mod tests {
             netadapter_args_for(1, true)[3].starts_with("[Console]::OutputEncoding="),
             "错误行若不能按 UTF-8 解码，回退失败原因会被整条丢掉"
         );
+    }
+
+    #[test]
+    fn metric_args_turn_automatic_off() {
+        let a = set_metric_args(19, 300);
+        assert_eq!(&a[..3], ["-NoProfile", "-NonInteractive", "-Command"]);
+        assert!(
+            a[3].ends_with("Set-NetIPInterface -InterfaceIndex 19 -InterfaceMetric 300 -AutomaticMetric Disabled -Confirm:$False"),
+            "{}",
+            a[3]
+        );
+        assert!(a[3].contains("-Confirm:$False"), "写入配置不得弹确认");
+    }
+
+    /// 「自动」必须同时让 Windows 重新计算，只去掉数值是不够的。
+    #[test]
+    fn auto_metric_args_only_touch_automatic_flag() {
+        let a = set_metric_auto_args(19);
+        assert!(
+            a[3].ends_with("Set-NetIPInterface -InterfaceIndex 19 -AutomaticMetric Enabled -Confirm:$False"),
+            "{}",
+            a[3]
+        );
+        assert!(a[3].contains("-Confirm:$False"), "写入配置不得弹确认");
+        assert!(!a[3].contains("InterfaceMetric 3"), "自动模式不应写死数值");
     }
 
     #[test]

@@ -248,6 +248,7 @@ unsafe fn build_nic(
 ) -> Nic {
     // IfIndex 藏在 Anonymous1.Anonymous 里（与 Length 共用 union）
     let if_index = a.Anonymous1.Anonymous.IfIndex;
+    let metric_entry = interface_metric(if_index, a.Luid);
     let mut nic = Nic {
         if_index,
         alias: alias.to_string(),
@@ -263,8 +264,8 @@ unsafe fn build_nic(
         enabled: !disabled,
         connected: a.OperStatus == IfOperStatusUp,
         is_default_route: defaults.contains(&if_index),
-        metric: interface_metric(if_index, a.Luid),
-        metric_auto: true,
+        metric: metric_entry.0,
+        metric_auto: metric_entry.1,
         network_guid: format_guid(&a.NetworkGuid),
     };
     unsafe { fill_addresses(a, &mut nic) };
@@ -442,16 +443,17 @@ unsafe fn socket_address_to_string(addr: &SOCKET_ADDRESS) -> String {
 
 /// 跃点数：`GetIpInterfaceEntry` 的 `Metric`（0.61.3 的绑定里没有 `RouteMetric` 成员，
 /// SDK 的 netioapi.h 同样只有 `ULONG Metric`，两者是同一个字段）。
-/// 读失败回 0（Task 7 把 0 显示成「自动/未知」），不让单张网卡的附加字段拖垮整张列表。
-fn interface_metric(if_index: u32, luid: NET_LUID_LH) -> u32 {
-    interface_metric_entry(if_index, luid).unwrap_or_default()
+/// 读失败回 `(0, true)`（详情里显示「自动」），不让单张网卡的附加字段拖垮整张列表。
+fn interface_metric(if_index: u32, luid: NET_LUID_LH) -> (u32, bool) {
+    interface_metric_entry(if_index, luid).unwrap_or((0, true))
 }
 
 /// `interface_metric` 的可诊断版本：把真实返回码/错误文本原样交出去，供真机冒烟测试打印。
+/// 返回 `(Metric, UseAutomaticMetric)`，一次调用读全，避免两处状态互相矛盾。
 ///
 /// # Safety 说明：`Family` + `InterfaceLuid` + `InterfaceIndex` 按要求填好再调用
 /// （LUID 与 Index 都给，API 优先用非零 LUID）。
-fn interface_metric_entry(if_index: u32, luid: NET_LUID_LH) -> Result<u32, String> {
+fn interface_metric_entry(if_index: u32, luid: NET_LUID_LH) -> Result<(u32, bool), String> {
     let mut row = MIB_IPINTERFACE_ROW {
         Family: AF_INET,
         InterfaceLuid: luid,
@@ -460,13 +462,23 @@ fn interface_metric_entry(if_index: u32, luid: NET_LUID_LH) -> Result<u32, Strin
     };
     let status = unsafe { GetIpInterfaceEntry(&mut row) };
     if status == ERROR_SUCCESS {
-        Ok(row.Metric)
+        Ok((row.Metric, row.UseAutomaticMetric))
     } else {
         Err(format!(
             "GetIpInterfaceEntry(ifindex={if_index})：{}（错误码 {}）",
             error_text(status.0),
             status.0
         ))
+    }
+}
+
+/// 详情里的跃点文案。自动模式下的 `Metric` 是 Windows 按链路速率算出来的结果，
+/// 单独印成数字会让用户以为是手填值，所以带上「自动」前缀；值为 0 说明没读到。
+pub fn metric_display(metric: u32, automatic: bool) -> String {
+    match (automatic, metric) {
+        (true, 0) => "自动".to_string(),
+        (true, m) => format!("自动（{m}）"),
+        (false, m) => m.to_string(),
     }
 }
 
@@ -1099,6 +1111,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn metric_display_marks_automatic() {
+        assert_eq!(metric_display(25, true), "自动（25）");
+        assert_eq!(metric_display(300, false), "300");
+        // 读不到跃点时（0）不能印成「自动（0）」
+        assert_eq!(metric_display(0, true), "自动");
+    }
+
     // ---------------- sockaddr 解码 ----------------
 
     /// IPv4 的 sockaddr：内存里就是这 4 个字节（网络字节序），Windows 也这么放
@@ -1412,12 +1432,13 @@ mod tests {
             println!("     description={}", r.description);
             println!("     alias={} adapter_name={}", r.alias, r.adapter_name);
             println!(
-                "     mac={} speed={} en={} conn={} metric={} gw={} ip={}/{} dns={:?}",
+                "     mac={} speed={} en={} conn={} metric={} auto={} gw={} ip={}/{} dns={:?}",
                 r.nic.mac,
                 r.nic.speed,
                 r.nic.enabled,
                 r.nic.connected,
                 r.nic.metric,
+                r.nic.metric_auto,
                 r.nic.gateway,
                 r.nic.ipv4,
                 r.nic.mask,
