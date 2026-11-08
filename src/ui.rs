@@ -24,9 +24,9 @@ use windows::Win32::UI::Controls::{
     ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVGF_GROUPID,
     LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS,
     LVM_ENABLEGROUPVIEW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW,
-    LVM_REMOVEALLGROUPS, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED,
-    LVN_ITEMCHANGED, LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, SB_SETPARTS,
-    SB_SETTEXTW,
+    LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW,
+    LVNI_SELECTED, LVN_ITEMCHANGED, LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW,
+    SB_SETPARTS, SB_SETTEXTW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -55,6 +55,21 @@ pub const IDM_DETAIL: u32 = 2002;
 pub const GRP_WIRED: i32 = 0;
 pub const GRP_WIRELESS: i32 = 1;
 pub const GRP_OTHER: i32 = 2;
+
+// 列表列宽（px）。IPv4/网关按 15 字符（169.254.xxx.xxx）留量；描述列在布局时吃掉剩余宽度，
+// 固定像素在窄窗口里会被视口直接裁掉，连省略号都看不到。
+const COL_NAME: i32 = 150;
+const COL_STATUS: i32 = 104;
+const COL_IP: i32 = 150;
+const COL_GW: i32 = 148;
+const COL_DESC_MIN: i32 = 160;
+const COL_DESC_INDEX: i32 = 4;
+
+/// 描述列宽度：列表客户区减去四列固定宽度。
+pub fn desc_column_width(list_client_w: i32) -> i32 {
+    // 额外留 2px 给主题边框与取整，否则算得刚好时会冒出横向滚动条
+    (list_client_w - (COL_NAME + COL_STATUS + COL_IP + COL_GW) - 2).max(COL_DESC_MIN)
+}
 
 /// 数字资源 ID 的 MAKEINTRESOURCE 等价写法。
 pub fn resource_id(id: u32) -> PCWSTR {
@@ -143,11 +158,11 @@ pub unsafe fn set_columns(hwnd: HWND) {
         return;
     }
     for (i, (name, width)) in [
-        ("名称", 160),
-        ("状态", 110),
-        ("IPv4", 120),
-        ("网关", 120),
-        ("描述", 260),
+        ("名称", COL_NAME),
+        ("状态", COL_STATUS),
+        ("IPv4", COL_IP),
+        ("网关", COL_GW),
+        ("描述", COL_DESC_MIN),
     ]
     .iter()
     .enumerate()
@@ -732,6 +747,25 @@ pub unsafe fn layout(hwnd: HWND) {
     let width = (rc.right - rc.left - margin * 2).max(0);
     let height = (rc.bottom - rc.top - top - sb_height - margin).max(0);
     let _ = MoveWindow(hl, margin, top, width, height, true);
+    fit_description_column(hl);
+}
+
+/// 描述列跟着窗口宽度伸缩（窗口可拖拽），避免固定宽度被视口硬裁。
+///
+/// # Safety
+/// `hl` 是主列表 ListView。
+unsafe fn fit_description_column(hl: HWND) {
+    let mut rc = RECT::default();
+    if GetClientRect(hl, &mut rc).is_err() {
+        return;
+    }
+    let w = desc_column_width(rc.right - rc.left);
+    let _ = SendMessageW(
+        hl,
+        LVM_SETCOLUMNWIDTH,
+        Some(WPARAM(COL_DESC_INDEX as usize)),
+        Some(LPARAM(w as isize)),
+    );
 }
 
 /// 通用控件初始化（ListView 分组与状态栏都依赖 comctl32 v6）。
@@ -948,6 +982,27 @@ mod tests {
         assert_eq!(group_of(NicKind::Wired), 0);
         assert_eq!(group_of(NicKind::Wireless), 1);
         assert_eq!(group_of(NicKind::Other), 2);
+    }
+
+    /// 列宽契约：IPv4/网关 必须装得下 15 字符地址，描述列吃满剩余宽度且不低于下限。
+    #[test]
+    fn column_widths_fit_address_length_and_fill_remainder() {
+        // 15 字符地址（169.254.206.73 / 192.168.100.200）实测约 130px，留 20px 余量
+        const {
+            assert!(COL_IP >= 140, "IPv4 列宽不足以显示完整地址");
+            assert!(COL_GW >= 140, "网关列宽不足以显示完整地址");
+        }
+        // 默认窗口列表客户区约 722px：描述列应把剩余宽度全部吃掉
+        assert_eq!(desc_column_width(722), 722 - (150 + 104 + 150 + 148) - 2);
+        // 窗口拉大 → 描述列变宽（线性跟随）
+        assert_eq!(
+            desc_column_width(922) - desc_column_width(722),
+            200,
+            "描述列应随窗口宽度线性变化"
+        );
+        // 窗口极窄时不低于下限，此时横向滚动条兜底
+        assert_eq!(desc_column_width(300), COL_DESC_MIN);
+        assert_eq!(desc_column_width(0), COL_DESC_MIN);
     }
 
     /// 资源 ID 必须与 res/resource.h 逐字一致（rc 侧改了这边没改会静默错位）

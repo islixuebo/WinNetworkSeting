@@ -30,6 +30,11 @@ pub const IF_TYPE_TUNNEL: u32 = 131;
 /// 虚拟以太网适配器就是 6），所以 `NicKind` 不可用来推断「这是物理卡」——
 /// 过滤只能靠 `is_virtual` + `is_virtual_if_type` + 物理地址长度。
 pub fn classify(if_type: u32, description: &str) -> NicKind {
+    // 蓝牙 PAN 实测 IfType=6(Ethernet)、真正的物理介质才是 Bluetooth；若只看 IfType
+    // 会误判成有线。蓝牙面板按用户裁定单列为「其他」，且优先于 IfType 判定。
+    if description.to_ascii_lowercase().contains("bluetooth") {
+        return NicKind::Other;
+    }
     match if_type {
         IF_TYPE_ETHERNET => NicKind::Wired,
         IF_TYPE_IEEE80211 | IF_TYPE_WWANPP | IF_TYPE_WWANPP2 => NicKind::Wireless,
@@ -188,7 +193,7 @@ mod tests {
     /// 每行描述都刻意只命中一个关键字，保证「删掉某个关键字」必有对应用例变红。
     #[test]
     fn classify_covers_every_if_type_and_keyword() {
-        let cases: [(&str, u32, &str, NicKind); 22] = [
+        let cases: [(&str, u32, &str, NicKind); 23] = [
             // IF_TYPE 精确分支：命中时描述完全不起作用
             ("if_type=6 有线", 6, "Something Unknown", NicKind::Wired),
             (
@@ -261,6 +266,13 @@ mod tests {
             // Task 4 边界：Description 为空/空白时不得 panic，也不得凭空归类
             ("0/空描述", 0, "", NicKind::Other),
             ("29/空白描述", 29, " ", NicKind::Other),
+            // 蓝牙 PAN 真机 IfType=6，只有物理介质是 Bluetooth：必须优先判成其他
+            (
+                "6/蓝牙 PAN",
+                6,
+                "Bluetooth Device (Personal Area Network)",
+                NicKind::Other,
+            ),
         ];
         for (label, if_type, description, expected) in cases {
             assert_eq!(
@@ -269,6 +281,22 @@ mod tests {
                 "用例 {label}：if_type={if_type}, 描述={description}"
             );
         }
+    }
+
+    /// 蓝牙优先于 IfType：真机蓝牙 PAN 报 IfType=6，只有描述里带 Bluetooth，
+    /// 若先按 IfType 判就会归到有线（用户已裁定归「其他」）。
+    #[test]
+    fn bluetooth_wins_over_if_type() {
+        for if_type in [0, 6, 71, 243] {
+            assert_eq!(
+                classify(if_type, "Bluetooth Device (Personal Area Network)"),
+                NicKind::Other,
+                "if_type={if_type} 的蓝牙适配器应归其他"
+            );
+        }
+        assert_eq!(classify(6, "BLUETOOTH PAN"), NicKind::Other);
+        // 反过来不能误伤：描述不含 bluetooth 的物理网卡照旧按 IfType 分类
+        assert_eq!(classify(6, "Realtek PCIe GbE Family"), NicKind::Wired);
     }
 
     /// 回退分支里无线判定先于有线判定（简报的实现顺序）：混合关键字时必须是无线。
