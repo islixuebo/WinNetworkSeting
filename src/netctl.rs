@@ -138,6 +138,112 @@ pub fn set_enabled(if_index: u32, alias: &str, enable: bool) -> Result<(), Strin
     }
 }
 
+/// 跑一条 PowerShell 并取回 stdout（CIM 读取通道）。输出必须能按 UTF-8 解码，
+/// 否则宁可报错也不把乱码当结果。
+pub fn ps_capture(args: &[String]) -> Result<String, String> {
+    let out = Command::new("powershell")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("启动 powershell 失败：{e}"))?;
+    if !out.status.success() {
+        return Err(failure_text(
+            "powershell",
+            out.status.code(),
+            &out.stdout,
+            &out.stderr,
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|_| "powershell 输出不是 UTF-8".to_string())
+}
+
+pub fn dhcp_read_args(if_index: u32) -> Vec<String> {
+    ps_args(&format!(
+        "(Get-NetIPInterface -InterfaceIndex {if_index} -AddressFamily IPv4).Dhcp.ToString()"
+    ))
+}
+
+pub fn parse_dhcp_flag(text: &str) -> Option<bool> {
+    match text.trim() {
+        "Enabled" => Some(true),
+        "Disabled" => Some(false),
+        _ => None,
+    }
+}
+
+pub fn dhcp_enabled(if_index: u32) -> Result<bool, String> {
+    let text = ps_capture(&dhcp_read_args(if_index))?;
+    parse_dhcp_flag(&text).ok_or_else(|| format!("无法识别 DHCP 状态：{}", text.trim()))
+}
+
+pub fn set_dhcp_args(if_index: u32, enable: bool) -> Vec<String> {
+    let state = if enable { "Enabled" } else { "Disabled" };
+    ps_args(&format!(
+        "Set-NetIPInterface -InterfaceIndex {if_index} -Dhcp {state} -Confirm:$False"
+    ))
+}
+
+/// 静态 IP：先关 DHCP，再清掉旧地址，最后写新地址。`gw` 为空时整段省略 ——
+/// 传 `-DefaultGateway ''` 会被 PowerShell 当成空参数报错。
+pub fn set_static_ip_args(if_index: u32, ip: &str, prefix: u8, gw: &str) -> Vec<String> {
+    let mut cmd = format!(
+        "Set-NetIPInterface -InterfaceIndex {if_index} -Dhcp Disabled -Confirm:$False; \
+         Remove-NetIPAddress -InterfaceIndex {if_index} -AddressFamily IPv4 -Confirm:$False -ErrorAction SilentlyContinue; \
+         New-NetIPAddress -InterfaceIndex {if_index} -IPAddress {ip} -PrefixLength {prefix}"
+    );
+    if !gw.is_empty() {
+        cmd.push_str(&format!(" -DefaultGateway {gw}"));
+    }
+    cmd.push_str(" -Confirm:$False");
+    ps_args(&cmd)
+}
+
+pub fn set_dns_args(if_index: u32, servers: &[String]) -> Vec<String> {
+    if servers.is_empty() {
+        return ps_args(&format!(
+            "Set-DnsClientServerAddress -InterfaceIndex {if_index} -ResetServerAddresses"
+        ));
+    }
+    ps_args(&format!(
+        "Set-DnsClientServerAddress -InterfaceIndex {if_index} -ServerAddresses {}",
+        servers.join(",")
+    ))
+}
+
+pub fn release_dhcp_args(if_index: u32) -> Vec<String> {
+    ps_args(&format!(
+        "Invoke-CimMethod -InputObject (Get-NetIPInterface -InterfaceIndex {if_index} -AddressFamily IPv4) -MethodName ReleaseDHCPLease"
+    ))
+}
+
+pub fn renew_dhcp_args(if_index: u32) -> Vec<String> {
+    ps_args(&format!(
+        "Invoke-CimMethod -InputObject (Get-NetIPInterface -InterfaceIndex {if_index} -AddressFamily IPv4) -MethodName RenewDHCPLease"
+    ))
+}
+
+pub struct IpConfig {
+    pub if_index: u32,
+    pub use_dhcp: bool,
+    pub ip: String,
+    pub mask: u8,
+    pub gw: String,
+    pub dns: Vec<String>,
+}
+
+/// 按顺序执行：DHCP/静态 → DNS。前一步失败就停，避免「IP 改了 DNS 没改」的半截状态。
+pub fn apply_ip_config(cfg: &IpConfig) -> Result<(), String> {
+    let step = if cfg.use_dhcp {
+        set_dhcp_args(cfg.if_index, true)
+    } else {
+        set_static_ip_args(cfg.if_index, &cfg.ip, cfg.mask, &cfg.gw)
+    };
+    run_netadapter(&step)?;
+    run_netadapter(&set_dns_args(cfg.if_index, &cfg.dns))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +333,51 @@ mod tests {
             "{}",
             a[3]
         );
+    }
+
+    #[test]
+    fn dhcp_flag_parser_understands_cim_output() {
+        // Get-NetIPInterface 的 Dhcp 是枚举，命令行里印成 Enabled/Disabled
+        assert_eq!(parse_dhcp_flag("Enabled\r\n"), Some(true));
+        assert_eq!(parse_dhcp_flag("Disabled\n"), Some(false));
+        assert_eq!(parse_dhcp_flag(""), None);
+        assert_eq!(parse_dhcp_flag("garbage"), None);
+    }
+
+    #[test]
+    fn static_ip_command_sets_address_and_gateway() {
+        let a = set_static_ip_args(19, "10.0.0.5", 24, "10.0.0.1");
+        assert!(
+            a[3].ends_with("Set-NetIPInterface -InterfaceIndex 19 -Dhcp Disabled -Confirm:$False; Remove-NetIPAddress -InterfaceIndex 19 -AddressFamily IPv4 -Confirm:$False -ErrorAction SilentlyContinue; New-NetIPAddress -InterfaceIndex 19 -IPAddress 10.0.0.5 -PrefixLength 24 -DefaultGateway 10.0.0.1 -Confirm:$False"),
+            "{}",
+            a[3]
+        );
+    }
+
+    /// 网关留空时必须整段省略 —— 传 `-DefaultGateway ''` 会被 PowerShell 当成空参数报错。
+    #[test]
+    fn static_ip_without_gateway_omits_flag() {
+        let a = set_static_ip_args(19, "10.0.0.5", 24, "");
+        assert!(!a[3].contains("-DefaultGateway"), "{}", a[3]);
+        assert!(a[3].contains("-PrefixLength 24"));
+    }
+
+    #[test]
+    fn dns_command_sends_all_servers_or_resets() {
+        let two = set_dns_args(19, &["1.1.1.1".into(), "8.8.8.8".into()]);
+        assert!(
+            two[3].ends_with("Set-DnsClientServerAddress -InterfaceIndex 19 -ServerAddresses 1.1.1.1,8.8.8.8"),
+            "{}",
+            two[3]
+        );
+        let none = set_dns_args(19, &[]);
+        assert!(none[3].contains("-ResetServerAddresses"), "{}", none[3]);
+    }
+
+    #[test]
+    fn dhcp_release_and_renew_are_ifindex_scoped() {
+        assert!(release_dhcp_args(19)[3].ends_with("Invoke-CimMethod -InputObject (Get-NetIPInterface -InterfaceIndex 19 -AddressFamily IPv4) -MethodName ReleaseDHCPLease"));
+        assert!(renew_dhcp_args(19)[3].ends_with("Invoke-CimMethod -InputObject (Get-NetIPInterface -InterfaceIndex 19 -AddressFamily IPv4) -MethodName RenewDHCPLease"));
     }
 
     #[test]
