@@ -31,6 +31,7 @@
 #define IDM_ENABLE      2000
 #define IDM_DISABLE     2001
 #define IDM_DETAIL      2002
+#define IDM_RENAME      2003
 
 #define IDC_STATUSBAR   3000
 

@@ -34,11 +34,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, GetDlgItem,
     GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadImageW, MessageBoxW, MoveWindow,
     SendMessageW, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, DWLP_MSGRESULT, ICON_BIG,
-    ICON_SMALL, IDYES, IMAGE_ICON, LR_SHARED, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO,
-    MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_SHOW,
-    TPM_LEFTALIGN, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
-    WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_NOTIFY, WM_SETFONT, WM_SETICON, WM_SIZE,
-    WM_SYSCOMMAND,
+    ICON_SMALL, IDYES, IMAGE_ICON, LR_SHARED, MB_ICONERROR, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
+    MB_YESNO, MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, SW_HIDE,
+    SW_SHOW, TPM_LEFTALIGN, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_NOTIFY, WM_SETFONT, WM_SETICON,
+    WM_SIZE, WM_SYSCOMMAND,
 };
 
 pub const IDD_MAIN: u32 = 100;
@@ -67,6 +67,7 @@ pub const IDC_NAV_TEST: u32 = 3102;
 pub const IDM_ENABLE: u32 = 2000;
 pub const IDM_DISABLE: u32 = 2001;
 pub const IDM_DETAIL: u32 = 2002;
+pub const IDM_RENAME: u32 = 2003;
 
 /// 左侧竖排导航项，顺序即 `res/app.rc` 中自上而下的顺序。
 pub const NAV_IDS: &[u32] = &[IDC_NAV_NIC, IDC_NAV_ROUTE, IDC_NAV_TEST];
@@ -720,6 +721,10 @@ pub unsafe fn sync_buttons(hwnd: HWND, hl: HWND) {
     if !h_dis.is_invalid() {
         let _ = EnableWindow(h_dis, has_sel && en_state);
     }
+    // 配置对话框作用于选中的那张卡；未选中时置灰，避免点了没反应
+    if let Ok(h_cfg) = GetDlgItem(Some(hwnd), IDC_CONFIG as i32) {
+        let _ = EnableWindow(h_cfg, has_sel);
+    }
 }
 
 /// # Safety
@@ -728,6 +733,50 @@ pub unsafe fn open_detail(hwnd: HWND) {
     match selected_nic(list_view(hwnd)) {
         Some(n) => crate::detail::show(hwnd, &n),
         None => set_status(hwnd, "未选择网卡"),
+    }
+}
+
+/// 改名：对话框拿名字 → 二次确认 → CIM 改名 → 刷新。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn on_rename(hwnd: HWND) {
+    let Some(nic) = selected_nic(list_view(hwnd)) else {
+        set_status(hwnd, "未选择网卡");
+        return;
+    };
+    let Some(name) = crate::forms::rename_dialog(hwnd, &nic) else {
+        return;
+    };
+    let question = wide(&format!("把「{}」改名为「{name}」？", nic.alias));
+    let title = wide("确认改名");
+    let yes = MessageBoxW(
+        Some(hwnd),
+        PCWSTR(question.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        MB_YESNO | MB_ICONQUESTION,
+    ) == IDYES;
+    if !yes {
+        return;
+    }
+    let args = netctl::rename_args(nic.if_index, &name);
+    match netctl::run_netadapter(&args) {
+        Ok(()) => {
+            set_status(hwnd, &format!("已改名为 {name}"));
+            refresh_list(hwnd);
+            sync_buttons(hwnd, list_view(hwnd));
+        }
+        Err(e) => {
+            set_status(hwnd, &format!("改名失败：{e}"));
+            let body = wide(&e);
+            let title = wide("改名失败");
+            let _ = MessageBoxW(
+                Some(hwnd),
+                PCWSTR(body.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            );
+        }
     }
 }
 
@@ -749,6 +798,7 @@ pub unsafe fn show_popup_menu(hwnd: HWND, hl: HWND) {
         (IDM_ENABLE, "启用", has_sel && !en_state),
         (IDM_DISABLE, "禁用", has_sel && en_state),
         (IDM_DETAIL, "详细信息", has_sel),
+        (IDM_RENAME, "重命名…", has_sel),
     ];
     for (id, label, usable) in menus {
         let flags = if usable {
@@ -1278,6 +1328,8 @@ pub unsafe extern "system" fn main_dlgproc(
                 IDC_ENABLE | IDM_ENABLE => on_toggle(hwnd, hl, true),
                 IDC_DISABLE | IDM_DISABLE => on_toggle(hwnd, hl, false),
                 IDC_DETAIL | IDM_DETAIL => open_detail(hwnd),
+                // Task 7 会把「配置...」换成完整配置对话框，先直接开改名
+                IDC_CONFIG | IDM_RENAME => on_rename(hwnd),
                 IDC_ROUTE_REFRESH => refresh_routes(hwnd),
                 // 刷新 DNS 缓存由阶段2 接线
                 _ => return 0,

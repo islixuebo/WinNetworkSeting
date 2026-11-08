@@ -56,6 +56,15 @@ pub fn set_metric_auto_args(if_index: u32) -> Vec<String> {
     ))
 }
 
+/// 改名同样按 ifIndex 寻址。名字走单引号字面量：中文、空格、`$` 都不会被 PowerShell 展开；
+/// 名字里的单引号按 PowerShell 规则翻倍转义。
+pub fn rename_args(if_index: u32, name: &str) -> Vec<String> {
+    let quoted = name.replace('\'', "''");
+    ps_args(&format!(
+        "Rename-NetAdapter -InterfaceIndex {if_index} -NewName '{quoted}'"
+    ))
+}
+
 /// `None` = 自动。两条路径都写进注册表，刷新后 `GetIpInterfaceEntry` 能读回。
 pub fn apply_metric(if_index: u32, metric: Option<u32>) -> Result<(), String> {
     match metric {
@@ -207,6 +216,17 @@ mod tests {
         );
         assert!(a[3].contains("-Confirm:$False"), "写入配置不得弹确认");
         assert!(!a[3].contains("InterfaceMetric 3"), "自动模式不应写死数值");
+    }
+
+    #[test]
+    fn rename_args_address_by_index() {
+        let a = rename_args(19, "办公网");
+        assert_eq!(&a[..3], ["-NoProfile", "-NonInteractive", "-Command"]);
+        assert!(
+            a[3].ends_with("Rename-NetAdapter -InterfaceIndex 19 -NewName '办公网'"),
+            "{}",
+            a[3]
+        );
     }
 
     #[test]

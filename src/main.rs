@@ -2,10 +2,12 @@
 
 pub mod adapterclass;
 pub mod detail;
+pub mod forms;
 pub mod netctl;
 pub mod netinfo;
 pub mod theme;
 pub mod ui;
+pub mod validate;
 pub mod winutil;
 
 use windows::core::PCWSTR;
