@@ -68,6 +68,8 @@ pub const IDM_ENABLE: u32 = 2000;
 pub const IDM_DISABLE: u32 = 2001;
 pub const IDM_DETAIL: u32 = 2002;
 pub const IDM_RENAME: u32 = 2003;
+pub const IDM_RELEASE: u32 = 2004;
+pub const IDM_RENEW: u32 = 2005;
 
 /// 左侧竖排导航项，顺序即 `res/app.rc` 中自上而下的顺序。
 pub const NAV_IDS: &[u32] = &[IDC_NAV_NIC, IDC_NAV_ROUTE, IDC_NAV_TEST];
@@ -780,6 +782,111 @@ pub unsafe fn on_rename(hwnd: HWND) {
     }
 }
 
+/// 改默认路由网卡 IP 的告警文案；非默认路由返回空串。
+pub fn nic_config_confirm(n: &Nic) -> &'static str {
+    if n.is_default_route {
+        "这张网卡承载默认路由，改动 IP/网关会立刻断网。\n继续后需重新配置网关才能恢复上网。"
+    } else {
+        ""
+    }
+}
+
+/// 「配置...」：名称 + 跃点 + IP/DNS 一次改完。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn on_config(hwnd: HWND) {
+    let Some(nic) = selected_nic(list_view(hwnd)) else {
+        set_status(hwnd, "未选择网卡");
+        return;
+    };
+    let warn = nic_config_confirm(&nic);
+    if !warn.is_empty() {
+        let body = wide(warn);
+        let title = wide("断网风险");
+        let yes = MessageBoxW(
+            Some(hwnd),
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONWARNING,
+        ) == IDYES;
+        if !yes {
+            return;
+        }
+    }
+    let Some(edit) = crate::forms::nic_config_dialog(hwnd, &nic) else {
+        return;
+    };
+    if edit.name != nic.alias {
+        if let Err(e) = netctl::run_netadapter(&netctl::rename_args(nic.if_index, &edit.name)) {
+            set_status(hwnd, &format!("改名失败：{e}"));
+            return;
+        }
+    }
+    // 跃点：只有真的变了才写。`None` = 自动，与 `metric_auto` 一起比较。
+    let metric_changed = match edit.metric {
+        None => !nic.metric_auto,
+        Some(m) => nic.metric_auto || m != nic.metric,
+    };
+    if metric_changed {
+        if let Err(e) = netctl::apply_metric(nic.if_index, edit.metric) {
+            set_status(hwnd, &format!("设置跃点失败：{e}"));
+            return;
+        }
+    }
+    // IP/DNS：同样只写变化项；否则每次点「确定」都会把网卡重启一遍。
+    let dhcp_now = netctl::dhcp_enabled(nic.if_index).unwrap_or(false);
+    let ip_changed = if edit.ip.use_dhcp {
+        !dhcp_now
+    } else {
+        dhcp_now
+            || edit.ip.ip != nic.ipv4
+            || edit.ip.gw != nic.gateway
+            || crate::validate::parse_mask(&nic.mask) != Some(edit.ip.mask)
+            || edit.ip.dns != nic.dns
+    };
+    if ip_changed {
+        if let Err(e) = netctl::apply_ip_config(&edit.ip) {
+            set_status(hwnd, &format!("设置 IP/DNS 失败：{e}"));
+            return;
+        }
+    }
+    set_status(hwnd, "配置已应用");
+    refresh_list(hwnd);
+    sync_buttons(hwnd, list_view(hwnd));
+}
+
+/// 释放 / 续期 DHCP 租约（右键菜单）。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn on_dhcp_action(hwnd: HWND, renew: bool) {
+    let Some(nic) = selected_nic(list_view(hwnd)) else {
+        set_status(hwnd, "未选择网卡");
+        return;
+    };
+    let args = if renew {
+        netctl::renew_dhcp_args(nic.if_index)
+    } else {
+        netctl::release_dhcp_args(nic.if_index)
+    };
+    match netctl::run_netadapter(&args) {
+        Ok(()) => {
+            set_status(
+                hwnd,
+                if renew {
+                    "已请求续期 DHCP 租约"
+                } else {
+                    "已释放 DHCP 租约"
+                },
+            );
+            refresh_list(hwnd);
+            sync_buttons(hwnd, list_view(hwnd));
+        }
+        Err(e) => set_status(hwnd, &format!("DHCP 操作失败：{e}")),
+    }
+}
+
 /// 在光标处弹出启用/禁用菜单。不带 TPM_RETURNCMD：选中项由系统以 WM_COMMAND
 /// 投给 owner 对话框，与按钮走同一条分发路径。
 ///
@@ -799,6 +906,8 @@ pub unsafe fn show_popup_menu(hwnd: HWND, hl: HWND) {
         (IDM_DISABLE, "禁用", has_sel && en_state),
         (IDM_DETAIL, "详细信息", has_sel),
         (IDM_RENAME, "重命名…", has_sel),
+        (IDM_RELEASE, "释放 DHCP 租约", has_sel),
+        (IDM_RENEW, "续期 DHCP 租约", has_sel),
     ];
     for (id, label, usable) in menus {
         let flags = if usable {
@@ -1328,8 +1437,10 @@ pub unsafe extern "system" fn main_dlgproc(
                 IDC_ENABLE | IDM_ENABLE => on_toggle(hwnd, hl, true),
                 IDC_DISABLE | IDM_DISABLE => on_toggle(hwnd, hl, false),
                 IDC_DETAIL | IDM_DETAIL => open_detail(hwnd),
-                // Task 7 会把「配置...」换成完整配置对话框，先直接开改名
-                IDC_CONFIG | IDM_RENAME => on_rename(hwnd),
+                IDC_CONFIG => on_config(hwnd),
+                IDM_RENAME => on_rename(hwnd),
+                IDM_RELEASE => on_dhcp_action(hwnd, false),
+                IDM_RENEW => on_dhcp_action(hwnd, true),
                 IDC_ROUTE_REFRESH => refresh_routes(hwnd),
                 // 刷新 DNS 缓存由阶段2 接线
                 _ => return 0,
@@ -1469,6 +1580,16 @@ mod tests {
             NicKind::Wireless,
             "WLAN"
         )));
+    }
+
+    /// 改 IP 的断网告警只在默认路由网卡上出现，否则每次点「确定」都白弹一次。
+    #[test]
+    fn ip_change_warns_only_for_default_route() {
+        let mut n = test_nic(19, "WLAN", NicKind::Wireless);
+        n.is_default_route = true;
+        assert!(nic_config_confirm(&n).contains("断网"));
+        n.is_default_route = false;
+        assert_eq!(nic_config_confirm(&n), "");
     }
 
     /// 未触发确认门时不得弹窗，直接放行（这条同时锁住「取消语义」：true = 继续执行）。

@@ -224,6 +224,7 @@ pub fn renew_dhcp_args(if_index: u32) -> Vec<String> {
     ))
 }
 
+#[derive(Clone)]
 pub struct IpConfig {
     pub if_index: u32,
     pub use_dhcp: bool,
