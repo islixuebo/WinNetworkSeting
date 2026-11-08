@@ -2,24 +2,30 @@
 //! 控件全部运行时创建（与 detail.rs 同套路），模板只提供空壳与标题栏。
 use std::cell::RefCell;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, GetSysColorBrush, SetBkMode, SetTextColor,
     COLOR_WINDOW, HGDIOBJ, TRANSPARENT,
 };
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DialogBoxParamW, EndDialog, GetClientRect, GetDlgItem, GetWindowTextLengthW,
     GetWindowTextW, MessageBoxW, SendMessageW, SetWindowTextW, BS_AUTOCHECKBOX, BS_GROUPBOX,
-    BS_PUSHBUTTON, CBS_DROPDOWNLIST, DLGPROC, ES_AUTOHSCROLL, HMENU, MB_ICONWARNING, MB_OK,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC,
+    BS_PUSHBUTTON, CBS_DROPDOWNLIST, DLGPROC, ES_AUTOHSCROLL, ES_READONLY, HMENU, MB_ICONWARNING,
+    MB_OK, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC,
     WM_ERASEBKGND, WM_INITDIALOG, WM_SETFONT, WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::netinfo::Nic;
 use crate::theme;
 use crate::ui::ui_font;
+use crate::wifi::Wlan;
 use crate::winutil::wide;
 
 pub const IDC_FORM_TEXT: u32 = 4000;
@@ -768,6 +774,192 @@ unsafe extern "system" fn route_proc(hwnd: HWND, msg: u32, wparam: WPARAM, _l: L
                 }
                 _ => 0,
             }
+        }
+        WM_CLOSE => {
+            let _ = EndDialog(hwnd, 0);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ---------------- Wi-Fi 详情对话框 ----------------
+
+const IDD_WLAN: u32 = 105;
+const WLAN_PASSWORD: u32 = 4300;
+const WLAN_COPY: u32 = 4301;
+const WLAN_HINT: u32 = 4302;
+
+thread_local! {
+    static WLAN: RefCell<Option<Wlan>> = const { RefCell::new(None) };
+}
+
+/// 弹出 Wi-Fi 详情：已保存网络显示密码并可复制，附近网络只显示概况。
+pub fn wlan_detail_dialog(parent: HWND, w: &Wlan) {
+    WLAN.with(|s| *s.borrow_mut() = Some(w.clone()));
+    unsafe {
+        let Ok(hmodule) = GetModuleHandleW(None) else {
+            return;
+        };
+        let dlg: DLGPROC = Some(wlan_proc);
+        let _ = DialogBoxParamW(
+            Some(HINSTANCE(hmodule.0)),
+            crate::ui::resource_id(IDD_WLAN),
+            Some(parent),
+            dlg,
+            LPARAM(0),
+        );
+    }
+}
+
+/// # Safety
+/// `parent` 必须是当前线程上存活、已创建的对话框；`id` 在同一个对话框内不能重复。
+unsafe fn add_readonly_edit(parent: HWND, x: i32, y: i32, w: i32, text: &str, id: u32) -> HWND {
+    create(
+        parent,
+        "EDIT",
+        text,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE((ES_AUTOHSCROLL | ES_READONLY) as u32),
+        x,
+        y,
+        w,
+        22,
+        id,
+    )
+}
+
+/// 写剪贴板：调用方保证 `text` 是用户明确要复制的密码。
+unsafe fn copy_to_clipboard(hwnd: HWND, text: &str) -> bool {
+    if OpenClipboard(Some(hwnd)).is_err() {
+        return false;
+    }
+    let mut ok = false;
+    if EmptyClipboard().is_ok() {
+        let w = wide(text);
+        let bytes = w.len() * std::mem::size_of::<u16>();
+        if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
+            let p = GlobalLock(h);
+            if p.is_null() {
+                let _ = GlobalFree(Some(h));
+            } else {
+                std::ptr::copy_nonoverlapping(w.as_ptr() as *const u8, p as *mut u8, bytes);
+                let _ = GlobalUnlock(h);
+                // 成功后内存归剪贴板所有，不能再 GlobalFree
+                if SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(h.0))).is_ok() {
+                    ok = true;
+                } else {
+                    let _ = GlobalFree(Some(h));
+                }
+            }
+        }
+    }
+    let _ = CloseClipboard();
+    ok
+}
+
+unsafe fn build_wlan_controls(hwnd: HWND, w: &Wlan) {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let cx = (rc.right - rc.left).max(360);
+    let cy = (rc.bottom - rc.top).max(230);
+    let margin = 14;
+    let label_w = 72;
+    let value_x = margin + label_w;
+    let value_w = (cx - value_x - margin).max(180);
+
+    add_label(
+        hwnd,
+        margin,
+        12,
+        cx - margin * 2,
+        &format!("SSID：{}", w.ssid),
+    );
+    add_label(hwnd, margin, 40, label_w, "类型");
+    add_label(hwnd, value_x, 40, value_w, crate::wifi::type_text(w.saved));
+    add_label(hwnd, margin, 64, label_w, "信号");
+    add_label(
+        hwnd,
+        value_x,
+        64,
+        value_w,
+        &crate::wifi::signal_text(w.signal),
+    );
+    add_label(hwnd, margin, 88, label_w, "加密方式");
+    add_label(hwnd, value_x, 88, value_w, &w.security);
+    add_label(hwnd, margin, 118, label_w, "密码");
+    add_readonly_edit(
+        hwnd,
+        value_x,
+        114,
+        value_w,
+        &crate::wifi::password_text(w),
+        WLAN_PASSWORD,
+    );
+
+    let copyable = w.saved && matches!(w.password.as_deref(), Some(p) if !p.is_empty());
+    let copy = add_button(hwnd, value_x, 146, 90, "复制密码", WLAN_COPY);
+    if !copyable {
+        let _ = EnableWindow(copy, false);
+    }
+    create(
+        hwnd,
+        "STATIC",
+        "",
+        WS_CHILD | WS_VISIBLE,
+        value_x + 100,
+        150,
+        (value_w - 100).max(0),
+        18,
+        WLAN_HINT,
+    );
+    add_button(hwnd, cx - margin - 90, cy - 38, 90, "关闭", 2);
+}
+
+unsafe extern "system" fn wlan_proc(hwnd: HWND, msg: u32, wparam: WPARAM, _l: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            crate::ui::set_title_icons(hwnd);
+            let entry = WLAN.with(|s| s.borrow().clone());
+            match entry {
+                Some(w) => build_wlan_controls(hwnd, &w),
+                None => {
+                    let _ = EndDialog(hwnd, 0);
+                }
+            }
+            1
+        }
+        WM_ERASEBKGND => {
+            fill_background(hwnd, wparam);
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, theme::TEXT);
+            GetSysColorBrush(COLOR_WINDOW).0 as isize
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u32;
+            if id == WLAN_COPY {
+                let text = WLAN.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .and_then(|w| w.password.clone())
+                        .unwrap_or_default()
+                });
+                let hint = if !text.is_empty() && copy_to_clipboard(hwnd, &text) {
+                    "已复制到剪贴板"
+                } else {
+                    "复制失败，可选中密码框按 Ctrl+C"
+                };
+                edit_text(hwnd, WLAN_HINT, hint);
+                return 1;
+            }
+            if id == 2 {
+                let _ = EndDialog(hwnd, 0);
+                return 1;
+            }
+            0
         }
         WM_CLOSE => {
             let _ = EndDialog(hwnd, 0);

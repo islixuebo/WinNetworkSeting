@@ -8,6 +8,7 @@ pub mod netinfo;
 pub mod theme;
 pub mod ui;
 pub mod validate;
+pub mod wifi;
 pub mod winutil;
 
 use windows::core::PCWSTR;

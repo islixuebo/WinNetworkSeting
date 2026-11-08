@@ -5,6 +5,7 @@
 #define IDD_RENAME      102
 #define IDD_NIC_CFG     103
 #define IDD_ROUTE       104
+#define IDD_WLAN        105
 
 #define IDI_APP         200
 
@@ -16,6 +17,7 @@
 #define IDC_DETAIL      1005
 #define IDC_RESET       1006
 #define IDC_CONFIG      1007
+#define IDC_NCPA        1008
 
 #define IDC_ROUTE_LIST      1010
 #define IDC_ROUTE_REFRESH   1011
@@ -27,6 +29,9 @@
 #define IDC_TEST_KIND       1022
 #define IDC_TEST_RUN        1023
 #define IDC_TEST_OUT        1024
+
+#define IDC_WLAN_REFRESH    1030
+#define IDC_WLAN_LIST       1031
 
 #define IDM_ENABLE      2000
 #define IDM_DISABLE     2001
@@ -40,3 +45,4 @@
 #define IDC_NAV_NIC     3100
 #define IDC_NAV_ROUTE   3101
 #define IDC_NAV_TEST    3102
+#define IDC_NAV_WLAN    3103

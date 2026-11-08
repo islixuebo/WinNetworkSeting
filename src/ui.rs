@@ -4,6 +4,7 @@ use crate::adapterclass::{kind_name, NicKind};
 use crate::netctl::{self, TestKind, TestResult};
 use crate::netinfo::{self, Nic, Route};
 use crate::theme;
+use crate::wifi::{self, Wlan};
 use crate::winutil::wide;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -18,6 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT,
@@ -27,10 +29,11 @@ use windows::Win32::UI::Controls::{
     LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_GETITEMCOUNT, LVM_GETITEMTEXTW, LVM_GETITEMW,
     LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS,
     LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED,
-    LVN_ITEMCHANGED, LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, SB_SETPARTS,
-    SB_SETTEXTW,
+    LVN_ITEMCHANGED, LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_DBLCLK,
+    SB_SETPARTS, SB_SETTEXTW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, GetDlgItem,
     GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadImageW, MessageBoxW, MoveWindow,
@@ -38,9 +41,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, DWLP_MSGRESULT, ICON_BIG, ICON_SMALL, IDYES,
     IMAGE_ICON, LR_SHARED, MB_ICONERROR, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
     MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_SHOW,
-    TPM_LEFTALIGN, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_NOTIFY, WM_SETFONT, WM_SETICON,
-    WM_SIZE, WM_SYSCOMMAND,
+    SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_APP, WM_CLOSE,
+    WM_COMMAND, WM_CONTEXTMENU, WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_NOTIFY, WM_SETFONT,
+    WM_SETICON, WM_SIZE, WM_SYSCOMMAND,
 };
 
 pub const IDD_MAIN: u32 = 100;
@@ -53,6 +56,7 @@ pub const IDC_FLUSH_DNS: u32 = 1004;
 pub const IDC_DETAIL: u32 = 1005;
 pub const IDC_RESET: u32 = 1006;
 pub const IDC_CONFIG: u32 = 1007;
+pub const IDC_NCPA: u32 = 1008;
 pub const IDC_ROUTE_LIST: u32 = 1010;
 pub const IDC_ROUTE_REFRESH: u32 = 1011;
 pub const IDC_ROUTE_ADD: u32 = 1012;
@@ -62,10 +66,13 @@ pub const IDC_TEST_TARGET: u32 = 1021;
 pub const IDC_TEST_KIND: u32 = 1022;
 pub const IDC_TEST_RUN: u32 = 1023;
 pub const IDC_TEST_OUT: u32 = 1024;
+pub const IDC_WLAN_REFRESH: u32 = 1030;
+pub const IDC_WLAN_LIST: u32 = 1031;
 pub const IDC_STATUSBAR: u32 = 3000;
 pub const IDC_NAV_NIC: u32 = 3100;
 pub const IDC_NAV_ROUTE: u32 = 3101;
 pub const IDC_NAV_TEST: u32 = 3102;
+pub const IDC_NAV_WLAN: u32 = 3103;
 pub const IDM_ENABLE: u32 = 2000;
 pub const IDM_DISABLE: u32 = 2001;
 pub const IDM_DETAIL: u32 = 2002;
@@ -74,14 +81,15 @@ pub const IDM_RELEASE: u32 = 2004;
 pub const IDM_RENEW: u32 = 2005;
 
 /// 左侧竖排导航项，顺序即 `res/app.rc` 中自上而下的顺序。
-pub const NAV_IDS: &[u32] = &[IDC_NAV_NIC, IDC_NAV_ROUTE, IDC_NAV_TEST];
+pub const NAV_IDS: &[u32] = &[IDC_NAV_NIC, IDC_NAV_ROUTE, IDC_NAV_TEST, IDC_NAV_WLAN];
 
-/// 三页导航。每页只显示自己的控件，页与页的控件集合两两不相交。
+/// 四页导航。每页只显示自己的控件，页与页的控件集合两两不相交。
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Page {
     Nic,
     Route,
     Test,
+    Wlan,
 }
 
 pub fn nav_of_page(p: Page) -> u32 {
@@ -89,6 +97,7 @@ pub fn nav_of_page(p: Page) -> u32 {
         Page::Nic => IDC_NAV_NIC,
         Page::Route => IDC_NAV_ROUTE,
         Page::Test => IDC_NAV_TEST,
+        Page::Wlan => IDC_NAV_WLAN,
     }
 }
 
@@ -97,6 +106,7 @@ pub fn page_of_nav(id: u32) -> Option<Page> {
         IDC_NAV_NIC => Some(Page::Nic),
         IDC_NAV_ROUTE => Some(Page::Route),
         IDC_NAV_TEST => Some(Page::Test),
+        IDC_NAV_WLAN => Some(Page::Wlan),
         _ => None,
     }
 }
@@ -112,9 +122,11 @@ pub fn page_toolbar_ids(p: Page) -> &'static [u32] {
             IDC_REFRESH,
             IDC_FLUSH_DNS,
             IDC_RESET,
+            IDC_NCPA,
         ],
         Page::Route => &[IDC_ROUTE_REFRESH, IDC_ROUTE_ADD, IDC_ROUTE_DEL],
         Page::Test => &[IDC_TEST_LABEL, IDC_TEST_TARGET, IDC_TEST_KIND, IDC_TEST_RUN],
+        Page::Wlan => &[IDC_WLAN_REFRESH],
     }
 }
 
@@ -124,6 +136,7 @@ pub fn page_fill_ids(p: Page) -> &'static [u32] {
         Page::Nic => &[IDC_LIST],
         Page::Route => &[IDC_ROUTE_LIST],
         Page::Test => &[IDC_TEST_OUT],
+        Page::Wlan => &[IDC_WLAN_LIST],
     }
 }
 
@@ -138,6 +151,7 @@ pub fn page_ids(p: Page) -> &'static [u32] {
             IDC_REFRESH,
             IDC_FLUSH_DNS,
             IDC_RESET,
+            IDC_NCPA,
             IDC_LIST,
         ],
         Page::Route => &[
@@ -153,6 +167,7 @@ pub fn page_ids(p: Page) -> &'static [u32] {
             IDC_TEST_RUN,
             IDC_TEST_OUT,
         ],
+        Page::Wlan => &[IDC_WLAN_REFRESH, IDC_WLAN_LIST],
     }
 }
 
@@ -163,6 +178,7 @@ pub fn current_page() -> Page {
     match CURRENT_PAGE.load(Ordering::Relaxed) {
         1 => Page::Route,
         2 => Page::Test,
+        3 => Page::Wlan,
         _ => Page::Nic,
     }
 }
@@ -173,6 +189,7 @@ pub fn set_current_page(p: Page) {
             Page::Nic => 0,
             Page::Route => 1,
             Page::Test => 2,
+            Page::Wlan => 3,
         },
         Ordering::Relaxed,
     );
@@ -682,6 +699,242 @@ pub fn route_status_text(n: usize) -> String {
         1 => "共 1 条路由".to_string(),
         n => format!("共 {n} 条路由"),
     }
+}
+
+// ---------------- WLAN 页 ----------------
+
+/// WLAN 行数据。列表本身不存数据，双击时按下标回查这份快照。
+fn wlan_rows() -> &'static Mutex<Vec<Wlan>> {
+    static ROWS: OnceLock<Mutex<Vec<Wlan>>> = OnceLock::new();
+    ROWS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn lock_wlans() -> std::sync::MutexGuard<'static, Vec<Wlan>> {
+    wlan_rows().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Wi-Fi 列宽：前三列固定，加密方式吃剩余宽度（与描述列同一套路）。
+pub fn wlan_column_widths(list_client_w: i32) -> [i32; 4] {
+    const NAME: i32 = 200;
+    const KIND: i32 = 70;
+    const SIGNAL: i32 = 112; // “96%（优）”不截断
+    let security = (list_client_w - NAME - KIND - SIGNAL - 2).max(140);
+    [NAME, KIND, SIGNAL, security]
+}
+
+pub fn wlan_status_text(wlans: &[Wlan]) -> String {
+    let saved = wlans.iter().filter(|w| w.saved).count();
+    match wlans.len() {
+        0 => "未发现 Wi-Fi 网络（无无线网卡或 WLAN 服务未启动）".to_string(),
+        n => format!("共 {n} 个 Wi-Fi，其中已保存 {saved} 个"),
+    }
+}
+
+/// # Safety
+/// `hwnd` 必须是主对话框，且 `IDC_WLAN_LIST` 已创建。
+unsafe fn wlan_list(hwnd: HWND) -> HWND {
+    GetDlgItem(Some(hwnd), IDC_WLAN_LIST as i32).unwrap_or_default()
+}
+
+/// # Safety
+/// `hwnd` 是主对话框，且 `IDC_WLAN_LIST` 已创建。
+pub unsafe fn set_wlan_columns(hwnd: HWND) {
+    let hl = wlan_list(hwnd);
+    if hl.is_invalid() {
+        return;
+    }
+    for (i, title) in ["名称（SSID）", "类型", "信号", "加密方式"]
+        .iter()
+        .enumerate()
+    {
+        let mut t = wide(title);
+        let mut item = LVCOLUMNW {
+            mask: LVCF_TEXT | LVCF_WIDTH,
+            cx: 100,
+            pszText: PWSTR(t.as_mut_ptr()),
+            cchTextMax: t.len() as i32,
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            hl,
+            LVM_INSERTCOLUMNW,
+            Some(WPARAM(i)),
+            Some(LPARAM((&mut item) as *mut _ as isize)),
+        );
+    }
+    fit_wlan_columns(hl);
+    enable_full_row_select(hl);
+    SendMessageW(
+        hl,
+        WM_SETFONT,
+        Some(WPARAM(ui_font().0 as usize)),
+        Some(LPARAM(1)),
+    );
+}
+
+/// # Safety
+/// `hl` 是 Wi-Fi 页的 ListView。
+unsafe fn fit_wlan_columns(hl: HWND) {
+    let mut rc = RECT::default();
+    if GetClientRect(hl, &mut rc).is_err() {
+        return;
+    }
+    for (i, w) in wlan_column_widths(rc.right - rc.left)
+        .into_iter()
+        .enumerate()
+    {
+        let _ = SendMessageW(
+            hl,
+            LVM_SETCOLUMNWIDTH,
+            Some(WPARAM(i)),
+            Some(LPARAM(w as isize)),
+        );
+    }
+}
+
+/// # Safety
+/// `hwnd` 是主对话框，且 `IDC_WLAN_LIST` 已创建。
+pub unsafe fn populate_wlan(hwnd: HWND, wlans: &[Wlan]) {
+    let hl = wlan_list(hwnd);
+    if hl.is_invalid() {
+        return;
+    }
+    let _ = SendMessageW(hl, LVM_DELETEALLITEMS, None, None);
+    for (row, w) in wlans.iter().enumerate() {
+        let cols = [
+            w.ssid.clone(),
+            wifi::type_text(w.saved).to_string(),
+            wifi::signal_text(w.signal),
+            w.security.clone(),
+        ];
+        let first = wide(&cols[0]);
+        let mut it = LVITEMW {
+            mask: LVIF_TEXT,
+            iItem: row as i32,
+            iSubItem: 0,
+            pszText: PWSTR(first.as_ptr() as *mut u16),
+            cchTextMax: first.len() as i32,
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            hl,
+            LVM_INSERTITEMW,
+            None,
+            Some(LPARAM(&mut it as *mut LVITEMW as isize)),
+        );
+        for (sub, text) in cols.iter().enumerate().skip(1) {
+            let t = wide(text);
+            let mut item = LVITEMW {
+                mask: LVIF_TEXT,
+                iItem: row as i32,
+                iSubItem: sub as i32,
+                pszText: PWSTR(t.as_ptr() as *mut u16),
+                cchTextMax: t.len() as i32,
+                ..Default::default()
+            };
+            let _ = SendMessageW(
+                hl,
+                LVM_SETITEMTEXTW,
+                Some(WPARAM(row)),
+                Some(LPARAM(&mut item as *mut LVITEMW as isize)),
+            );
+        }
+    }
+}
+
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn wlans_are_empty(hwnd: HWND) -> bool {
+    let hl = wlan_list(hwnd);
+    hl.is_invalid() || SendMessageW(hl, LVM_GETITEMCOUNT, None, None).0 == 0
+}
+
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn refresh_wlan(hwnd: HWND) {
+    set_status(hwnd, "正在读取 Wi-Fi 列表…");
+    match wifi::list_networks() {
+        Ok(rows) => {
+            populate_wlan(hwnd, &rows);
+            set_status(hwnd, &wlan_status_text(&rows));
+            *lock_wlans() = rows;
+        }
+        Err(e) => {
+            populate_wlan(hwnd, &[]);
+            *lock_wlans() = Vec::new();
+            set_status(hwnd, &e);
+        }
+    }
+}
+
+/// 双击一行：已保存网络弹详情并可看/复制密码，附近网络只显示概况。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn on_wlan_activate(hwnd: HWND) {
+    let Some(idx) = selected_index(wlan_list(hwnd)) else {
+        set_status(hwnd, "未选择网络");
+        return;
+    };
+    let picked = lock_wlans().get(idx).cloned();
+    match picked {
+        Some(w) => crate::forms::wlan_detail_dialog(hwnd, &w),
+        None => set_status(hwnd, "列表已刷新，请重新选择"),
+    }
+}
+
+/// 打开系统的「网络连接」面板（ncpa.cpl）。
+///
+/// 直接起 control.exe，不走文件关联：部分系统上 `cplfile` 只注册了 `cplopen`
+/// 动词，ShellExecute 用 `open` 会返回 SE_ERR_NOASSOC(31)。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn on_open_ncpa(hwnd: HWND) {
+    let exe = wide(&control_path());
+    let params = wide(&format!("\"{}\"", ncpa_path()));
+    let r = ShellExecuteW(
+        Some(hwnd),
+        PCWSTR::null(),
+        PCWSTR(exe.as_ptr()),
+        PCWSTR(params.as_ptr()),
+        PCWSTR::null(),
+        SW_SHOWNORMAL,
+    );
+    let code = r.0 as isize;
+    if code <= 32 {
+        // ShellExecute 的返回码不是 Win32 错误码，直接带出来便于排查
+        set_status(
+            hwnd,
+            &format!("打开网络连接面板失败（ShellExecute 返回 {code}）"),
+        );
+    }
+}
+
+/// 系统目录里的绝对路径。ShellExecute 不按 PATH 解析，只写文件名会在当前目录找不到。
+fn system_file_path(name: &str) -> String {
+    let mut buf = [0u16; 260];
+    let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    if n == 0 || n >= buf.len() {
+        return name.to_string();
+    }
+    system_file_path_from(&String::from_utf16_lossy(&buf[..n]), name)
+}
+
+pub fn system_file_path_from(system_dir: &str, name: &str) -> String {
+    let dir = system_dir.trim_end_matches(['\\', '/']);
+    if dir.is_empty() {
+        return name.to_string();
+    }
+    format!("{dir}\\{name}")
+}
+
+pub fn ncpa_path() -> String {
+    system_file_path("ncpa.cpl")
+}
+
+pub fn control_path() -> String {
+    system_file_path("control.exe")
 }
 
 /// 当前选中行号。分组视图下 LVM_GETNEXTITEM 返回的是插入序（= state().nics 下标），
@@ -1518,7 +1771,7 @@ pub unsafe fn on_list_notify(hwnd: HWND, nmh: &mut NMHDR) -> Option<isize> {
 /// # Safety
 /// `hwnd` 是主对话框；缺失的控件会被 `GetDlgItem` 过滤掉，不会崩。
 pub unsafe fn apply_page(hwnd: HWND, page: Page) {
-    for p in [Page::Nic, Page::Route, Page::Test] {
+    for p in [Page::Nic, Page::Route, Page::Test, Page::Wlan] {
         let show = if p == page { SW_SHOW } else { SW_HIDE };
         for id in page_ids(p) {
             if let Ok(h) = GetDlgItem(Some(hwnd), *id as i32) {
@@ -1527,14 +1780,24 @@ pub unsafe fn apply_page(hwnd: HWND, page: Page) {
         }
     }
     set_current_page(page);
-    // 首次切到路由页才采集，避免每次点击都跑一遍 IP Helper
+    // 首次切到路由/Wi-Fi 页才采集，避免每次点击都跑一遍系统调用
+    let mut refreshed = false;
     if page == Page::Route {
         if routes_are_empty(hwnd) {
             refresh_routes(hwnd);
+            refreshed = true;
         }
         if let Ok(hv) = GetDlgItem(Some(hwnd), IDC_ROUTE_LIST as i32) {
             sync_route_buttons(hwnd, hv);
         }
+    }
+    if page == Page::Wlan && wlans_are_empty(hwnd) {
+        refresh_wlan(hwnd);
+        refreshed = true;
+    }
+    // 状态栏是全窗口共享的：不恢复就会留着上一页的统计文案
+    if !refreshed {
+        set_status(hwnd, &page_status(hwnd, page));
     }
     for id in NAV_IDS {
         if let Ok(h) = GetDlgItem(Some(hwnd), *id as i32) {
@@ -1542,6 +1805,36 @@ pub unsafe fn apply_page(hwnd: HWND, page: Page) {
         }
     }
     layout(hwnd);
+}
+
+/// 各页自己的状态栏文案（切页时恢复，避免串页）。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+unsafe fn page_status(hwnd: HWND, page: Page) -> String {
+    match page {
+        Page::Nic => {
+            let guard = lock_state();
+            match &guard.err {
+                Some(e) => format!("读取网卡信息失败：{e}"),
+                None => format!("共 {} 个物理网卡", guard.nics.len()),
+            }
+        }
+        Page::Route => {
+            let n = GetDlgItem(Some(hwnd), IDC_ROUTE_LIST as i32)
+                .map(|h| SendMessageW(h, LVM_GETITEMCOUNT, None, None).0)
+                .unwrap_or(0);
+            route_status_text(n.max(0) as usize)
+        }
+        Page::Wlan => wlan_status_text(&lock_wlans()),
+        Page::Test => {
+            if TEST_BUSY.load(Ordering::SeqCst) {
+                "测试进行中…".to_string()
+            } else {
+                "就绪".to_string()
+            }
+        }
+    }
 }
 
 /// 工具条底边 = 该页所有工具条控件客户区底边的最大值 + 6px。
@@ -1615,6 +1908,11 @@ pub unsafe fn layout(hwnd: HWND) {
     } else if page == Page::Route {
         if let Ok(hl) = GetDlgItem(Some(hwnd), IDC_ROUTE_LIST as i32) {
             fit_route_columns(hl);
+        }
+    } else if page == Page::Wlan {
+        let hl = wlan_list(hwnd);
+        if !hl.is_invalid() {
+            fit_wlan_columns(hl);
         }
     }
 }
@@ -1709,6 +2007,7 @@ pub unsafe extern "system" fn main_dlgproc(
             }
             set_columns(hwnd);
             set_route_columns(hwnd);
+            set_wlan_columns(hwnd);
             ensure_groups(hwnd);
             init_status_bar(hwnd);
             init_test_kind(hwnd);
@@ -1759,9 +2058,11 @@ pub unsafe extern "system" fn main_dlgproc(
                 IDM_RENEW => on_dhcp_action(hwnd, true),
                 IDC_FLUSH_DNS => on_flush_dns(hwnd),
                 IDC_RESET => on_reset(hwnd),
+                IDC_NCPA => on_open_ncpa(hwnd),
                 IDC_ROUTE_REFRESH => refresh_routes(hwnd),
                 IDC_ROUTE_ADD => on_route_add(hwnd),
                 IDC_ROUTE_DEL => on_route_delete(hwnd),
+                IDC_WLAN_REFRESH => refresh_wlan(hwnd),
                 IDC_TEST_RUN => on_test_run(hwnd),
                 IDC_TEST_KIND if code == CBN_SELCHANGE => on_test_kind_changed(hwnd),
                 _ => return 0,
@@ -1786,6 +2087,10 @@ pub unsafe extern "system" fn main_dlgproc(
                 return 0;
             }
             let nmh = &mut *(lparam.0 as *mut NMHDR);
+            if nmh.code == NM_DBLCLK && nmh.hwndFrom == wlan_list(hwnd) {
+                on_wlan_activate(hwnd);
+                return 0;
+            }
             if nmh.code == LVN_ITEMCHANGED && nmh.hwndFrom == list_view(hwnd) {
                 sync_buttons(hwnd, nmh.hwndFrom);
                 return 0;
@@ -2022,6 +2327,7 @@ mod tests {
             ("IDC_DETAIL", IDC_DETAIL),
             ("IDC_RESET", IDC_RESET),
             ("IDC_CONFIG", IDC_CONFIG),
+            ("IDC_NCPA", IDC_NCPA),
             ("IDC_ROUTE_LIST", IDC_ROUTE_LIST),
             ("IDC_ROUTE_REFRESH", IDC_ROUTE_REFRESH),
             ("IDC_ROUTE_ADD", IDC_ROUTE_ADD),
@@ -2031,9 +2337,12 @@ mod tests {
             ("IDC_TEST_KIND", IDC_TEST_KIND),
             ("IDC_TEST_RUN", IDC_TEST_RUN),
             ("IDC_TEST_OUT", IDC_TEST_OUT),
+            ("IDC_WLAN_REFRESH", IDC_WLAN_REFRESH),
+            ("IDC_WLAN_LIST", IDC_WLAN_LIST),
             ("IDC_NAV_NIC", IDC_NAV_NIC),
             ("IDC_NAV_ROUTE", IDC_NAV_ROUTE),
             ("IDC_NAV_TEST", IDC_NAV_TEST),
+            ("IDC_NAV_WLAN", IDC_NAV_WLAN),
             ("IDM_ENABLE", IDM_ENABLE),
             ("IDM_DISABLE", IDM_DISABLE),
             ("IDM_DETAIL", IDM_DETAIL),
@@ -2080,6 +2389,7 @@ mod tests {
         (IDC_NAV_NIC, "IDC_NAV_NIC"),
         (IDC_NAV_ROUTE, "IDC_NAV_ROUTE"),
         (IDC_NAV_TEST, "IDC_NAV_TEST"),
+        (IDC_NAV_WLAN, "IDC_NAV_WLAN"),
         (IDC_ENABLE, "IDC_ENABLE"),
         (IDC_DISABLE, "IDC_DISABLE"),
         (IDC_CONFIG, "IDC_CONFIG"),
@@ -2087,10 +2397,12 @@ mod tests {
         (IDC_REFRESH, "IDC_REFRESH"),
         (IDC_FLUSH_DNS, "IDC_FLUSH_DNS"),
         (IDC_RESET, "IDC_RESET"),
+        (IDC_NCPA, "IDC_NCPA"),
         (IDC_ROUTE_REFRESH, "IDC_ROUTE_REFRESH"),
         (IDC_ROUTE_ADD, "IDC_ROUTE_ADD"),
         (IDC_ROUTE_DEL, "IDC_ROUTE_DEL"),
         (IDC_TEST_RUN, "IDC_TEST_RUN"),
+        (IDC_WLAN_REFRESH, "IDC_WLAN_REFRESH"),
     ];
 
     /// 控件 ID → .rc 里的符号名。
@@ -2102,6 +2414,7 @@ mod tests {
             (IDC_TEST_TARGET, "IDC_TEST_TARGET"),
             (IDC_TEST_KIND, "IDC_TEST_KIND"),
             (IDC_TEST_OUT, "IDC_TEST_OUT"),
+            (IDC_WLAN_LIST, "IDC_WLAN_LIST"),
         ];
         BUTTON_NAMES
             .iter()
@@ -2203,7 +2516,7 @@ mod tests {
         use std::collections::HashSet;
         let rc = include_str!("../res/app.rc");
         let mut seen = HashSet::new();
-        for p in [Page::Nic, Page::Route, Page::Test] {
+        for p in [Page::Nic, Page::Route, Page::Test, Page::Wlan] {
             for id in page_ids(p) {
                 assert!(seen.insert(*id), "控件 {id} 被两个页面同时声明");
             }
@@ -2224,7 +2537,7 @@ mod tests {
     /// 大块区域控件必须包含在该页面的全部控件里，否则切换页面会留下没被隐藏的空框。
     #[test]
     fn fill_controls_belong_to_their_page() {
-        for p in [Page::Nic, Page::Route, Page::Test] {
+        for p in [Page::Nic, Page::Route, Page::Test, Page::Wlan] {
             for id in page_fill_ids(p) {
                 assert!(page_ids(p).contains(id), "{id} 不在页面 {:?} 的全集里", p);
             }
@@ -2232,6 +2545,7 @@ mod tests {
         assert_eq!(page_fill_ids(Page::Nic), &[IDC_LIST]);
         assert_eq!(page_fill_ids(Page::Route), &[IDC_ROUTE_LIST]);
         assert_eq!(page_fill_ids(Page::Test), &[IDC_TEST_OUT]);
+        assert_eq!(page_fill_ids(Page::Wlan), &[IDC_WLAN_LIST]);
     }
 
     #[test]
@@ -2239,14 +2553,15 @@ mod tests {
         assert_eq!(page_of_nav(nav_of_page(Page::Nic)), Some(Page::Nic));
         assert_eq!(page_of_nav(nav_of_page(Page::Route)), Some(Page::Route));
         assert_eq!(page_of_nav(nav_of_page(Page::Test)), Some(Page::Test));
+        assert_eq!(page_of_nav(nav_of_page(Page::Wlan)), Some(Page::Wlan));
         assert_eq!(page_of_nav(IDC_LIST), None);
-        // 三个导航项互不相同，否则点一个会选中两个
-        let ids: Vec<u32> = [Page::Nic, Page::Route, Page::Test]
+        // 四个导航项互不相同，否则点一个会选中两个
+        let ids: Vec<u32> = [Page::Nic, Page::Route, Page::Test, Page::Wlan]
             .into_iter()
             .map(nav_of_page)
             .collect();
         let uniq: std::collections::HashSet<u32> = ids.iter().copied().collect();
-        assert_eq!(uniq.len(), 3);
+        assert_eq!(uniq.len(), 4);
     }
 
     /// 导航是左侧一竖列，工具条是右侧一横行 —— 两者都不许混。
@@ -2259,7 +2574,7 @@ mod tests {
             .filter(|(id, _)| NAV_IDS.contains(id))
             .map(|(_, r)| *r)
             .collect();
-        assert_eq!(nav.len(), 3);
+        assert_eq!(nav.len(), 4);
         for i in 1..nav.len() {
             let r = nav[i];
             assert_eq!(r.x, nav[0].x, "导航项必须同列");
@@ -2373,5 +2688,67 @@ mod tests {
         assert!(s.contains("Ping 10.0.0.1"), "{s}");
         assert!(s.contains("完成"), "{s}");
         assert!(s.contains("Pinging 10.0.0.1"), "{s}");
+    }
+
+    #[test]
+    fn ncpa_path_is_absolute_and_exists() {
+        assert_eq!(
+            system_file_path_from("C:\\Windows\\System32", "ncpa.cpl"),
+            "C:\\Windows\\System32\\ncpa.cpl"
+        );
+        assert_eq!(
+            system_file_path_from("C:\\Windows\\System32\\", "ncpa.cpl"),
+            "C:\\Windows\\System32\\ncpa.cpl",
+            "尾部斜杠不能拼出双反斜杠"
+        );
+        assert_eq!(system_file_path_from("", "ncpa.cpl"), "ncpa.cpl");
+        assert_eq!(system_file_path_from("", "control.exe"), "control.exe");
+        let real = ncpa_path();
+        assert!(
+            std::path::Path::new(&real).is_file(),
+            "系统目录里应存在 ncpa.cpl：{real}"
+        );
+        let ctl = control_path();
+        assert!(
+            std::path::Path::new(&ctl).is_file(),
+            "系统目录里应存在 control.exe：{ctl}"
+        );
+    }
+
+    #[test]
+    fn wlan_columns_fill_viewport() {
+        let w = wlan_column_widths(700);
+        assert_eq!(w, [200, 70, 112, 316]);
+        assert_eq!(
+            w.iter().sum::<i32>() + 2,
+            700,
+            "四列宽度之和应吃满视口（留 2px 边框）"
+        );
+        assert_eq!(wlan_column_widths(300)[3], 140, "窄窗口下加密列不低于下限");
+    }
+
+    #[test]
+    fn wlan_status_counts_saved_and_nearby() {
+        let rows = [
+            Wlan {
+                ssid: "Office".into(),
+                saved: true,
+                signal: Some(88),
+                security: "WPA2-PSK / AES".into(),
+                password: Some("pw".into()),
+            },
+            Wlan {
+                ssid: "Cafe".into(),
+                saved: false,
+                signal: Some(40),
+                security: "开放（无加密）".into(),
+                password: None,
+            },
+        ];
+        assert_eq!(wlan_status_text(&rows), "共 2 个 Wi-Fi，其中已保存 1 个");
+        assert_eq!(
+            wlan_status_text(&[]),
+            "未发现 Wi-Fi 网络（无无线网卡或 WLAN 服务未启动）"
+        );
     }
 }

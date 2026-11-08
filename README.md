@@ -20,11 +20,14 @@ WPF 版（同仓库上一代实现）留在外层目录作对照，本目录是�
 
 ### 阶段2
 
-- 左侧导航三页：网卡配置 / 系统路由表 / 网络测试
-- 网卡配置页：列表 + 启用/禁用/配置…/详细/刷新/刷新 DNS 缓存/重置网络
+- 左侧导航四页：网卡配置 / 系统路由表 / 网络测试 / WLAN 密码
+- 网卡配置页：列表 + 启用/禁用/配置…/详细/刷新/刷新 DNS 缓存/重置网络/网络连接
+- 「网络连接」按钮打开系统 `ncpa.cpl` 面板（直接起 `control.exe`，不依赖文件关联）
 - 网卡配置对话框：改名、跃点（自动/手动）、IP/DNS（DHCP↔静态）、DHCP 释放/续期
 - 系统路由表页：IPv4+IPv6 全量路由，接口名映射；添加/删除持久路由（删默认路由前告警）
 - 网络测试页：Ping / Tracert / Nslookup / Ipconfig，工作线程执行、输出原样回显
+- WLAN 密码页：本机已保存的 Wi-Fi 配置 + 附近扫描到的热点，列 名称（SSID）/类型/信号/加密方式；
+  双击已保存网络打开详情（明文密码 + 复制密码）；无无线网卡或 WLAN 服务未启动时列表为空并给出提示
 
 阶段3：Profile 切换（兼容 WPF 版 `profiles.json`）
 
@@ -69,4 +72,9 @@ exe 带 `requireAdministrator` manifest，双击或 `Start-Process` 都会走 UA
   跃点写入必须同时设 `-AutomaticMetric Disabled`，只写数值会被系统重新算掉
 - 控制台工具（ping/tracert/nslookup/ipconfig）的输出按 OEM 代码页解码
   （`GetOEMCP` + `MultiByteToWideChar`），按 UTF-8 硬解会得到替换符
+- Wi-Fi 数据全部走 WLAN API（`WlanEnumInterfaces` / `WlanScan` / `WlanGetAvailableNetworkList` /
+  `WlanGetProfileList` / `WlanGetProfile`，后者带 `WLAN_PROFILE_GET_PLAINTEXT_KEY` 取明文密码）；
+  密码从 profile XML 的 `<keyMaterial>` 解析并反转义，不解析 `netsh wlan` 的本地化输出
+- 「网络连接」启动 `%SystemRoot%\System32\control.exe` 并传入 `ncpa.cpl` 绝对路径：
+  部分系统上 `cplfile` 只注册了 `cplopen` 动词，ShellExecute 用 `open` 会返回 `SE_ERR_NOASSOC(31)`
 - 依赖只有 `windows` crate；图标为 `res/app.ico`（16/24/32/48/256），运行时 `WM_SETICON` 挂标题栏
