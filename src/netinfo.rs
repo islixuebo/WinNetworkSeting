@@ -11,14 +11,15 @@ use windows::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GetAdaptersAddresses, GetIfEntry2, GetIpForwardTable2, GetIpInterfaceEntry,
     GAA_FLAG_INCLUDE_ALL_COMPARTMENTS, GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_INCLUDE_GATEWAYS,
     IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_DNS_SERVER_ADDRESS_XP, IP_ADAPTER_GATEWAY_ADDRESS_LH,
-    IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
-    MIB_IPINTERFACE_ROW,
+    IP_ADAPTER_UNICAST_ADDRESS_LH, IP_ADDRESS_PREFIX, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
+    MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
 };
 use windows::Win32::NetworkManagement::Ndis::{
     IfOperStatusUp, NET_IF_ADMIN_STATUS_DOWN, NET_LUID_LH,
 };
 use windows::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKET_ADDRESS,
+    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
+    SOCKET_ADDRESS,
 };
 
 /// 一张物理网卡的全部可显示信息。字段与 Task 5 的列、Task 7 的详情行一一对应。
@@ -527,6 +528,148 @@ fn default_route_interfaces() -> Result<Vec<u32>, String> {
         FreeMibTable(table.cast::<core::ffi::c_void>());
     }
     Ok(ifaces)
+}
+
+/// 一条路由。字段就是路由页的列，顺序也按列来，避免 UI 里再拼一次。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Route {
+    pub destination: String,
+    pub next_hop: String,
+    pub if_index: u32,
+    pub metric: u32,
+    pub protocol: String,
+    pub origin: String,
+    pub loopback: bool,
+    pub immortal: bool,
+}
+
+/// `MIB_IPPROTO_*` 中实际会在本机出现的取值。未收录的返回空串，由 `protocol_text` 兜底。
+pub fn protocol_name(code: i32) -> &'static str {
+    match code {
+        2 => "本地",
+        3 => "手动",
+        8 => "RIP",
+        13 => "OSPF",
+        14 => "BGP",
+        19 => "DHCP",
+        10002 => "自动静态",
+        10006 => "静态",
+        10007 => "静态(非DOD)",
+        _ => "",
+    }
+}
+
+/// 协议列文字：未知协议印成「协议 N」而不是留空，否则表格里会出现无名行。
+pub fn protocol_text(code: i32) -> String {
+    let n = protocol_name(code);
+    if n.is_empty() {
+        format!("协议 {code}")
+    } else {
+        n.to_string()
+    }
+}
+
+/// `NL_ROUTE_ORIGIN` 已文档化的取值。
+pub fn origin_name(code: i32) -> &'static str {
+    match code {
+        0 => "手动",
+        1 => "系统",
+        2 => "DHCP",
+        3 => "路由通告",
+        4 => "6to4",
+        _ => "",
+    }
+}
+
+pub fn origin_text(code: i32) -> String {
+    let n = origin_name(code);
+    if n.is_empty() {
+        format!("来源 {code}")
+    } else {
+        n.to_string()
+    }
+}
+
+/// `SOCKADDR_INET` → 文本。union 的三个分支都是 POD，先读 `si_family` 再读对应分支，
+/// 不会触及未初始化内存；其它地址族返回空串。
+pub fn inet_text(addr: &SOCKADDR_INET) -> String {
+    let family = unsafe { addr.si_family };
+    if family == AF_INET {
+        let raw = unsafe { addr.Ipv4.sin_addr.S_un.S_addr };
+        Ipv4Addr::from(u32::from_be(raw)).to_string()
+    } else if family == AF_INET6 {
+        Ipv6Addr::from(unsafe { addr.Ipv6.sin6_addr.u.Byte }).to_string()
+    } else {
+        String::new()
+    }
+}
+
+pub fn prefix_text(prefix: &IP_ADDRESS_PREFIX) -> String {
+    let dest = inet_text(&prefix.Prefix);
+    if dest.is_empty() {
+        String::new()
+    } else {
+        format!("{dest}/{}", prefix.PrefixLength)
+    }
+}
+
+/// 全量路由表（IPv4 + IPv6）。`GetIpForwardTable2` 只接受单地址族，两次调用后合并，
+/// 顺序统一交给 `sort_routes`。
+pub fn list_routes() -> Result<Vec<Route>, String> {
+    let mut out = Vec::new();
+    for family in [AF_INET, AF_INET6] {
+        let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        let status = unsafe { GetIpForwardTable2(family, &mut table) };
+        if status != ERROR_SUCCESS || table.is_null() {
+            return Err(format!(
+                "{family:?} 路由表读取失败：{}（错误码 {}）",
+                error_text(status.0),
+                status.0
+            ));
+        }
+        unsafe {
+            // Table 是 [MIB_IPFORWARD_ROW2; 1] 的柔性数组尾巴，真实行数看 NumEntries
+            let header = &*table;
+            let rows =
+                std::slice::from_raw_parts(header.Table.as_ptr(), header.NumEntries as usize);
+            for row in rows {
+                let row: &MIB_IPFORWARD_ROW2 = row;
+                out.push(Route {
+                    destination: prefix_text(&row.DestinationPrefix),
+                    next_hop: inet_text(&row.NextHop),
+                    if_index: row.InterfaceIndex,
+                    metric: row.Metric,
+                    protocol: protocol_text(row.Protocol.0),
+                    origin: origin_text(row.Origin.0),
+                    loopback: row.Loopback,
+                    immortal: row.Immortal,
+                });
+            }
+            FreeMibTable(table.cast::<core::ffi::c_void>());
+        }
+    }
+    sort_routes(&mut out);
+    Ok(out)
+}
+
+/// 接口升序 → 跃点升序 → 默认路由优先 → 目的前缀字典序。
+pub fn sort_routes(routes: &mut [Route]) {
+    routes.sort_by(|a, b| {
+        a.if_index
+            .cmp(&b.if_index)
+            .then(a.metric.cmp(&b.metric))
+            .then_with(|| default_first(&a.destination).cmp(&default_first(&b.destination)))
+            .then(a.destination.cmp(&b.destination))
+    });
+}
+
+/// 默认路由排在所属接口的最前面：`0.0.0.0/0`、`::/0` 都得排 0。
+fn default_first(dest: &str) -> u8 {
+    if dest.ends_with("/0") {
+        0
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
@@ -1327,5 +1470,96 @@ mod tests {
                 r.adapter_name
             );
         }
+    }
+
+    // ---------------- Route ----------------
+
+    #[test]
+    fn protocol_names_cover_what_windows_actually_reports() {
+        assert_eq!(protocol_name(2), "本地"); // MIB_IPPROTO_LOCAL
+        assert_eq!(protocol_name(3), "手动"); // MIB_IPPROTO_NETMGMT
+        assert_eq!(protocol_name(19), "DHCP"); // MIB_IPPROTO_DHCP
+        assert_eq!(protocol_name(10006), "静态"); // MIB_IPPROTO_NT_STATIC
+        assert_eq!(protocol_name(10002), "自动静态");
+        assert_eq!(protocol_name(13), "OSPF");
+        // 未收录的协议不能显示空串，否则表格里会出现无名行
+        assert_eq!(protocol_text(9999), "协议 9999");
+    }
+
+    #[test]
+    fn origin_names_cover_all_documented_values() {
+        assert_eq!(origin_name(0), "手动");
+        assert_eq!(origin_name(1), "系统");
+        assert_eq!(origin_name(2), "DHCP");
+        assert_eq!(origin_name(3), "路由通告");
+        assert_eq!(origin_name(4), "6to4");
+        assert_eq!(origin_text(99), "来源 99");
+    }
+
+    /// 用 union 的 Ipv4 分支填一个地址；`S_addr` 是内存里的网络序字节。
+    fn prefix_v4(bytes: [u8; 4], len: u8) -> IP_ADDRESS_PREFIX {
+        let mut p = IP_ADDRESS_PREFIX::default();
+        // 写 union 字段（Copy 类型）不需要 unsafe；读才需要
+        p.Prefix.Ipv4.sin_family = AF_INET;
+        p.Prefix.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(bytes);
+        p.PrefixLength = len;
+        p
+    }
+
+    #[test]
+    fn ipv4_prefix_text_uses_prefix_length() {
+        assert_eq!(prefix_text(&prefix_v4([10, 0, 0, 0], 24)), "10.0.0.0/24");
+    }
+
+    /// 默认路由必须印成 0.0.0.0/0 —— 路由页要靠它识别默认出口。
+    #[test]
+    fn default_route_prefix_text() {
+        assert_eq!(prefix_text(&prefix_v4([0, 0, 0, 0], 0)), "0.0.0.0/0");
+    }
+
+    /// 排序：接口升序 → 跃点升序 → 目的前缀字典序；同接口内默认路由排最前。
+    #[test]
+    fn routes_sort_by_interface_metric_then_destination() {
+        let mk = |if_index: u32, dest: &str, metric: u32| Route {
+            destination: dest.into(),
+            next_hop: "0.0.0.0".into(),
+            if_index,
+            metric,
+            protocol: "本地".into(),
+            origin: "系统".into(),
+            loopback: false,
+            immortal: false,
+        };
+        let mut v = vec![
+            mk(19, "10.0.0.0/24", 256),
+            mk(19, "0.0.0.0/0", 25),
+            mk(3, "fe80::/64", 256),
+        ];
+        sort_routes(&mut v);
+        assert_eq!(
+            v.iter()
+                .map(|r| (r.if_index, r.destination.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "fe80::/64"), (19, "0.0.0.0/0"), (19, "10.0.0.0/24")]
+        );
+    }
+
+    /// 真机路由表冒烟：至少要有回环与默认路由，且每行 destination 都能解析成 a.b.c.d/nn。
+    #[test]
+    #[ignore]
+    fn real_route_table_has_loopback_and_default() {
+        let routes = list_routes().expect("读取路由表失败");
+        assert!(!routes.is_empty());
+        assert!(routes.iter().any(|r| r.loopback), "缺回环路由");
+        assert!(
+            routes.iter().any(|r| r.destination.ends_with("/0")),
+            "缺默认路由"
+        );
+        for r in &routes {
+            let (addr, len) = r.destination.rsplit_once('/').expect("缺前缀长度");
+            assert!(addr.parse::<std::net::IpAddr>().is_ok(), "坏地址 {addr}");
+            assert!(len.parse::<u8>().is_ok(), "坏前缀 {len}");
+        }
+        println!("路由 {}/IPv4+IPv6", routes.len());
     }
 }
