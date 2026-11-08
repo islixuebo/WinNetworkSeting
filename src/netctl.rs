@@ -1,7 +1,13 @@
 // Task 6：网卡启用/禁用。设计指定走 netsh 子进程（瞬时开销，不影响常驻内存）；
 // 本机实测 netsh 的 interface 上下文只认「已与路由器一起注册」的 3 个接口名，
 // 列表里的 5 条有 4 条（WLAN 2/4/5、蓝牙网络连接）按名字点不到，故补一条按 ifIndex 的 CIM 回退。
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
+
+/// netsh/powershell 都是控制台程序：GUI 进程没有控制台，CreateProcess 会给子进程
+/// 新建一个控制台窗口，界面上就是「点启用/禁用闪一下黑窗」。CREATE_NO_WINDOW 让它
+/// 在没有窗口的控制台里跑，stdout/stderr 管道不受影响。
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// name=<alias> 作为单个参数元素传给 netsh：Rust 不经 shell 分词，别名含空格也安全。
 pub fn netsh_args_for(alias: &str, enable: bool) -> Vec<String> {
@@ -42,6 +48,7 @@ pub fn run_netadapter(args: &[String]) -> Result<(), String> {
 fn run(program: &str, args: &[String]) -> Result<(), String> {
     let out = Command::new(program)
         .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
