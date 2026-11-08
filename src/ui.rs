@@ -651,6 +651,7 @@ pub unsafe fn populate_routes(hwnd: HWND, routes: &[Route]) {
             );
         }
     }
+    sync_route_buttons(hwnd, hl);
 }
 
 /// # Safety
@@ -666,12 +667,20 @@ pub unsafe fn refresh_routes(hwnd: HWND) {
     match netinfo::list_routes() {
         Ok(routes) => {
             populate_routes(hwnd, &routes);
-            set_status(hwnd, &format!("共 {} 条路由", routes.len()));
+            set_status(hwnd, &route_status_text(routes.len()));
         }
         Err(e) => {
             populate_routes(hwnd, &[]);
             set_status(hwnd, &format!("读取路由表失败：{e}"));
         }
+    }
+}
+
+pub fn route_status_text(n: usize) -> String {
+    match n {
+        0 => "没有可用路由".to_string(),
+        1 => "共 1 条路由".to_string(),
+        n => format!("共 {n} 条路由"),
     }
 }
 
@@ -1111,16 +1120,15 @@ unsafe fn selected_route(hl: HWND) -> Option<(String, String, u32)> {
 /// # Safety
 /// `hv` 是路由 ListView（`IDC_ROUTE_LIST`）。
 pub unsafe fn sync_route_buttons(hwnd: HWND, hv: HWND) {
-    if let Ok(h_del) = GetDlgItem(Some(hwnd), IDC_ROUTE_DEL as i32) {
-        let has_sel = SendMessageW(
-            hv,
-            LVM_GETNEXTITEM,
-            Some(WPARAM(usize::MAX)),
-            Some(LPARAM(LVNI_SELECTED as isize)),
-        )
-        .0 >= 0;
-        let _ = EnableWindow(h_del, has_sel);
-    }
+    let selected = SendMessageW(
+        hv,
+        LVM_GETNEXTITEM,
+        Some(WPARAM(usize::MAX)),
+        Some(LPARAM(LVNI_SELECTED as isize)),
+    )
+    .0 as i32
+        >= 0;
+    set_control_enabled(hwnd, IDC_ROUTE_DEL, selected);
 }
 
 /// 删除选中路由；默认路由要额外确认。
@@ -1514,8 +1522,13 @@ pub unsafe fn apply_page(hwnd: HWND, page: Page) {
     }
     set_current_page(page);
     // 首次切到路由页才采集，避免每次点击都跑一遍 IP Helper
-    if page == Page::Route && routes_are_empty(hwnd) {
-        refresh_routes(hwnd);
+    if page == Page::Route {
+        if routes_are_empty(hwnd) {
+            refresh_routes(hwnd);
+        }
+        if let Ok(hv) = GetDlgItem(Some(hwnd), IDC_ROUTE_LIST as i32) {
+            sync_route_buttons(hwnd, hv);
+        }
     }
     for id in NAV_IDS {
         if let Ok(h) = GetDlgItem(Some(hwnd), *id as i32) {
@@ -2331,6 +2344,13 @@ mod tests {
         assert!(valid_target(TestKind::Ping, "10.0.0.1 & del x").is_err(), "不许带 shell 元字符");
         assert!(valid_target(TestKind::Nslookup, "example.com").is_ok());
         assert!(valid_target(TestKind::IpConfig, "").is_ok());
+    }
+
+    #[test]
+    fn route_status_counts_rows() {
+        assert_eq!(route_status_text(0), "没有可用路由");
+        assert_eq!(route_status_text(1), "共 1 条路由");
+        assert_eq!(route_status_text(58), "共 58 条路由");
     }
 
     /// 报告头必须包含命令与结果摘要，否则用户不知道这段输出来自哪次测试。
