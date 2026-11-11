@@ -408,6 +408,144 @@ pub fn run_test(kind: TestKind, target: &str) -> TestResult {
     }
 }
 
+/// 预置目标：默认网关排第一（诊断第一跳），其余是回环与常用公共 DNS/域名。
+pub fn test_presets(gateway: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    let g = gateway.trim();
+    if !g.is_empty() {
+        v.push(g.to_string());
+    }
+    for s in ["127.0.0.1", "114.114.114.114", "223.5.5.5", "8.8.8.8", "www.baidu.com"] {
+        if !v.iter().any(|x| x == s) {
+            v.push(s.to_string());
+        }
+    }
+    v
+}
+
+/// 把控制台原始输出翻译成人话：结论 + 可能原因 + 下一步定位建议。
+pub fn explain_test(kind: TestKind, text: &str) -> String {
+    match kind {
+        TestKind::Ping => explain_ping(text),
+        TestKind::Tracert => explain_tracert(text),
+        TestKind::Nslookup => explain_nslookup(text),
+        TestKind::IpConfig => explain_ipconfig(text),
+    }
+}
+
+fn contains_any(text: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|m| text.contains(m))
+}
+
+/// 「(25% 丢失)」/「(25% loss)」里 % 前的数字。
+fn loss_percent(text: &str) -> Option<u32> {
+    let pos = text.find('%')?;
+    let digits: String = text[..pos]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse().ok()
+}
+
+fn number_after(text: &str, markers: &[&str]) -> Option<u32> {
+    for m in markers {
+        if let Some(pos) = text.find(m) {
+            let digits: String = text[pos + m.len()..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn latency_tier(ms: u32) -> &'static str {
+    match ms {
+        0..=1 => "延迟极低（本机或同网段设备）。",
+        2..=10 => "局域网水平，优秀。",
+        11..=50 => "良好。",
+        51..=150 => "一般，跨地域访问的正常水平。",
+        _ => "偏高，可能是跨洲链路、拥塞或无线链路质量差。",
+    }
+}
+
+fn explain_ping(text: &str) -> String {
+    if contains_any(text, &["找不到主机", "could not find host"]) {
+        return "域名解析失败：DNS 没能把这个名字翻译成 IP。先检查域名拼写；再用 Nslookup 或直接 Ping 公共 IP（如 223.5.5.5）区分是 DNS 问题还是网络问题。".into();
+    }
+    // 「无法访问目标主机」的回复会被 ping 计为已接收，必须先于 0% 丢失判断。
+    if contains_any(text, &["无法访问目标主机", "Destination host unreachable"]) {
+        return "目标不可达：本机或沿途路由器没有去往目标的路由。检查默认网关与本机 IP 配置（是否 169.254.x.x）。".into();
+    }
+    match loss_percent(text) {
+        Some(0) => {
+            let mut s = "连通正常：0% 丢失，目标可达。".to_string();
+            if let Some(avg) = number_after(text, &["平均 = ", "Average = "]) {
+                s.push_str(&format!(" 平均延迟 {avg}ms，{}", latency_tier(avg)));
+            }
+            s
+        }
+        Some(100) => "全部丢包，目标不可达。可能原因：目标关机、防火墙禁 Ping、本机断网。逐跳定位：先 Ping 127.0.0.1（协议栈），再 Ping 默认网关（本机网络），最后 Ping 公共 IP（外网）。".into(),
+        Some(p) => format!("丢包 {p}%：链路不稳定。常见于 Wi-Fi 信号差/干扰、网线接触不良、沿途拥塞或目标限速。先 Ping 默认网关：网关也丢包则是本机链路问题，网关正常则问题在外网路径。"),
+        None => "未能从输出里解析出统计信息，请查看上方原始输出。".into(),
+    }
+}
+
+fn explain_tracert(text: &str) -> String {
+    let mut hop_count = 0u32;
+    let mut first_star = None;
+    for line in text.lines() {
+        if line.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
+            hop_count += 1;
+            if first_star.is_none() && line.matches('*').count() >= 3 {
+                first_star = Some(hop_count);
+            }
+        }
+    }
+    let complete = contains_any(text, &["跟踪完成", "Trace complete"]);
+    if let Some(n) = first_star {
+        if complete {
+            return format!("已到达目标，共 {hop_count} 跳。第 {n} 跳无回应但后续继续：该节点只是不回应 ICMP，转发正常，一般不是故障。");
+        }
+        if n == 1 {
+            return "第一跳（默认网关）就无回应：问题在本机到网关之间。检查网线/Wi-Fi 连接、网关设备是否正常工作。".into();
+        }
+        return format!("从第 {n} 跳开始无回应，故障可能在该节点或其上联链路；第 {} 跳是最后有回应的位置。", n - 1);
+    }
+    if complete {
+        return format!("已到达目标，共 {hop_count} 跳，路径全程有回应。");
+    }
+    "未到达目标（达到最大跳数或中断）。查看上方最后几跳，定位停在哪一段。".into()
+}
+
+fn explain_nslookup(text: &str) -> String {
+    if contains_any(text, &["timed out", "请求超时", "超时"]) {
+        return "DNS 服务器无响应：检查本机 DNS 配置，或换用公共 DNS（223.5.5.5 / 114.114.114.114）再试。".into();
+    }
+    if contains_any(text, &["Non-existent domain", "找不到", "can't find"]) {
+        return "域名不存在（NXDOMAIN）：DNS 服务器正常但查不到这个名字，检查拼写或确认域名已注册。".into();
+    }
+    if contains_any(text, &["名称:", "Name:"]) {
+        return "解析正常：域名已解析到上方地址。".into();
+    }
+    "未能判定解析结果，请查看上方原始输出。".into()
+}
+
+fn explain_ipconfig(text: &str) -> String {
+    if text.contains("169.254.") {
+        return "出现 169.254.x.x 自动私有地址：DHCP 获取失败。检查网线/Wi-Fi 是否连上、DHCP 服务是否正常，或在网卡配置里改用静态 IP。".into();
+    }
+    "重点看三项：IPv4 地址、默认网关、DNS 服务器是否齐全；网关为空或 169.254 开头都意味着上不了外网。".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,5 +832,152 @@ mod tests {
         let r = run_test(TestKind::Ping, "127.0.0.1");
         assert_eq!(r.code, Some(0), "{}", r.text);
         assert!(r.text.contains("127.0.0.1"));
+    }
+
+    const PING_OK_ZH: &str = "正在 Ping 127.0.0.1 具有 32 字节的数据:\n\
+        来自 127.0.0.1 的回复: 字节=32 时间<1ms TTL=128\n\n\
+        127.0.0.1 的 Ping 统计信息:\n    \
+        数据包: 已发送 = 4，已接收 = 4，丢失 = 0 (0% 丢失)，\n\
+        往返行程的估计时间(以毫秒为单位):\n    \
+        最短 = 0ms，最长 = 0ms，平均 = 0ms\n";
+
+    #[test]
+    fn explain_ping_all_received_is_normal() {
+        let s = explain_test(TestKind::Ping, PING_OK_ZH);
+        assert!(s.contains("正常"), "{s}");
+        assert!(s.contains("0%"), "{s}");
+    }
+
+    #[test]
+    fn explain_ping_reports_latency() {
+        let text = PING_OK_ZH.replace("平均 = 0ms", "平均 = 120ms");
+        let s = explain_test(TestKind::Ping, &text);
+        assert!(s.contains("120"), "{s}");
+        assert!(s.contains("延迟"), "{s}");
+    }
+
+    #[test]
+    fn explain_ping_partial_loss_blames_link() {
+        let text = PING_OK_ZH.replace("(0% 丢失)", "(25% 丢失)");
+        let s = explain_test(TestKind::Ping, &text);
+        assert!(s.contains("丢包"), "{s}");
+        assert!(s.contains("不稳定"), "{s}");
+    }
+
+    #[test]
+    fn explain_ping_total_loss_suggests_hop_by_hop() {
+        let text = PING_OK_ZH.replace("(0% 丢失)", "(100% 丢失)");
+        let s = explain_test(TestKind::Ping, &text);
+        assert!(s.contains("不可达"), "{s}");
+        assert!(s.contains("网关"), "{s}");
+    }
+
+    #[test]
+    fn explain_ping_dns_failure() {
+        let s = explain_test(
+            TestKind::Ping,
+            "Ping 请求找不到主机 bad.example。请检查该名称并尝试重新解析。",
+        );
+        assert!(s.contains("解析"), "{s}");
+        assert!(s.contains("DNS"), "{s}");
+    }
+
+    /// 「无法访问目标主机」的回复会被 ping 计为已接收（0% 丢失），
+    /// 解说必须先认这句，不能掉进「0% 丢失 = 正常」的分支。
+    #[test]
+    fn explain_ping_unreachable_beats_zero_loss() {
+        let text = format!(
+            "来自 10.0.0.5 的回复: 无法访问目标主机。\n{}",
+            PING_OK_ZH
+        );
+        let s = explain_test(TestKind::Ping, &text);
+        assert!(!s.contains("正常"), "{s}");
+        assert!(s.contains("网关") || s.contains("路由"), "{s}");
+    }
+
+    #[test]
+    fn explain_ping_english_loss() {
+        let s = explain_test(
+            TestKind::Ping,
+            "Packets: Sent = 4, Received = 0, Lost = 4 (100% loss),",
+        );
+        assert!(s.contains("不可达"), "{s}");
+    }
+
+    #[test]
+    fn explain_tracert_complete_star_is_not_fault() {
+        let text = "  1    <1 毫秒    <1 毫秒    <1 毫秒  10.0.0.1\n  \
+            2     *        *        *     请求超时。\n  \
+            3    12 ms    11 ms    12 ms  93.184.216.34\n\
+            跟踪完成。\n";
+        let s = explain_test(TestKind::Tracert, text);
+        assert!(s.contains("到达"), "{s}");
+        assert!(s.contains("ICMP"), "{s}");
+    }
+
+    #[test]
+    fn explain_tracert_first_hop_timeout_blames_gateway() {
+        let text = "  1     *        *        *     请求超时。\n  \
+            2     *        *        *     请求超时。\n";
+        let s = explain_test(TestKind::Tracert, text);
+        assert!(s.contains("网关"), "{s}");
+    }
+
+    #[test]
+    fn explain_tracert_stops_midway_points_at_hop() {
+        let text = "  1    <1 毫秒    <1 毫秒  10.0.0.1\n  \
+            2    10 ms    10 ms  10.1.0.1\n  \
+            3     *        *        *     请求超时。\n  \
+            4     *        *        *     请求超时。\n";
+        let s = explain_test(TestKind::Tracert, text);
+        assert!(s.contains("3"), "{s}");
+    }
+
+    #[test]
+    fn explain_nslookup_timeout() {
+        let s = explain_test(
+            TestKind::Nslookup,
+            "DNS request timed out.\ntimeout was 2 seconds.\n请求超时。",
+        );
+        assert!(s.contains("DNS"), "{s}");
+    }
+
+    #[test]
+    fn explain_nslookup_nxdomain() {
+        let s = explain_test(
+            TestKind::Nslookup,
+            "*** public1.alidns.com 找不到 bad.example: Non-existent domain",
+        );
+        assert!(s.contains("不存在"), "{s}");
+    }
+
+    #[test]
+    fn explain_nslookup_ok() {
+        let s = explain_test(
+            TestKind::Nslookup,
+            "服务器:  public1.alidns.com\nAddress:  223.5.5.5\n\n\
+            名称:    www.baidu.com\nAddresses:  110.242.68.3\n",
+        );
+        assert!(s.contains("正常"), "{s}");
+    }
+
+    #[test]
+    fn explain_ipconfig_apipa_warns_dhcp() {
+        let s = explain_test(
+            TestKind::IpConfig,
+            "IPv4 地址 . . . . . . . . . . . . : 169.254.12.34( preferred)",
+        );
+        assert!(s.contains("DHCP"), "{s}");
+    }
+
+    #[test]
+    fn presets_gateway_first_and_fixed_list() {
+        let p = test_presets("10.0.0.1");
+        assert_eq!(p[0], "10.0.0.1");
+        assert!(p.contains(&"223.5.5.5".to_string()));
+        assert!(p.contains(&"www.baidu.com".to_string()));
+        let no_gw = test_presets("");
+        assert!(!no_gw.iter().any(|s| s.is_empty()));
+        assert_eq!(no_gw[0], "127.0.0.1");
     }
 }

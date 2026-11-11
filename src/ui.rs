@@ -12,10 +12,10 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, FillRect,
-    InvalidateRect, RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CALCRECT, DT_CENTER,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HFONT,
-    HGDIOBJ, OUT_DEFAULT_PRECIS, PS_SOLID, TRANSPARENT,
+    GetSysColorBrush, InvalidateRect, RoundRect, ScreenToClient, SelectObject, SetBkMode,
+    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET, DT_CALCRECT,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC,
+    HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
@@ -24,11 +24,12 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT,
     CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT,
-    ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
-    LVGF_GROUPID, LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_PARAM, LVIF_TEXT, LVITEMW,
-    LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_GETITEMCOUNT, LVM_GETITEMTEXTW, LVM_GETITEMW,
-    LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED,
+    ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVGF_GROUPID, LVGF_HEADER, LVGROUP, LVHITTESTINFO,
+    LVIF_GROUPID, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_GETITEMCOUNT, LVM_GETITEMTEXTW,
+    LVM_GETITEMW, LVM_GETNEXTITEM, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW,
+    LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE,
+    LVM_SETITEMTEXTW, LVIS_FOCUSED, LVIS_SELECTED, LVNI_SELECTED,
     LVN_ITEMCHANGED, LVS_EX_FULLROWSELECT, NMHDR, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_DBLCLK,
     SB_SETPARTS, SB_SETTEXTW,
 };
@@ -36,14 +37,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, GetDlgItem,
-    GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadImageW, MessageBoxW, MoveWindow,
+    GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadImageW, MapDialogRect, MessageBoxW, MoveWindow,
     PostMessageW, SendMessageW, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, CBN_SELCHANGE,
-    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, DWLP_MSGRESULT, ICON_BIG, ICON_SMALL, IDYES,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CB_SETITEMHEIGHT, DWLP_MSGRESULT, ICON_BIG, ICON_SMALL, IDYES,
     IMAGE_ICON, LR_SHARED, MB_ICONERROR, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
-    MESSAGEBOX_RESULT, MF_GRAYED, MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_SHOW,
+    MESSAGEBOX_RESULT, MF_GRAYED, MF_SEPARATOR, MF_STRING, SC_MINIMIZE, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_SHOW,
     SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_TOPALIGN, WINDOW_LONG_PTR_INDEX, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_CONTEXTMENU, WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_NOTIFY, WM_SETFONT,
-    WM_SETICON, WM_SIZE, WM_SYSCOMMAND,
+    WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG,
+    WM_NOTIFY, WM_SETFONT, WM_SETICON, WM_SIZE, WM_SYSCOMMAND,
 };
 
 pub const IDD_MAIN: u32 = 100;
@@ -79,6 +80,9 @@ pub const IDM_DETAIL: u32 = 2002;
 pub const IDM_RENAME: u32 = 2003;
 pub const IDM_RELEASE: u32 = 2004;
 pub const IDM_RENEW: u32 = 2005;
+pub const IDM_WLAN_DETAIL: u32 = 2010;
+pub const IDM_WLAN_COPY: u32 = 2011;
+pub const IDM_WLAN_COPY_SSID: u32 = 2012;
 
 /// 左侧竖排导航项，顺序即 `res/app.rc` 中自上而下的顺序。
 pub const NAV_IDS: &[u32] = &[IDC_NAV_NIC, IDC_NAV_ROUTE, IDC_NAV_TEST, IDC_NAV_WLAN];
@@ -1226,7 +1230,11 @@ pub fn test_report(kind: TestKind, target: &str, r: &TestResult) -> String {
             r.summary()
         )
     };
-    format!("{head}\r\n{}\r\n", r.text)
+    format!(
+        "{head}\r\n{}\r\n【解说】\r\n{}\r\n",
+        r.text,
+        netctl::explain_test(kind, &r.text)
+    )
 }
 
 static TEST_BUSY: AtomicBool = AtomicBool::new(false);
@@ -1309,6 +1317,120 @@ unsafe fn init_test_kind(hwnd: HWND) {
         let _ = SendMessageW(h, CB_ADDSTRING, None, Some(LPARAM(t.as_ptr() as isize)));
     }
     let _ = SendMessageW(h, CB_SETCURSEL, Some(WPARAM(0)), None);
+}
+
+/// 目标下拉预置：默认网关 + 回环/公共 DNS/常用域名，仍可手动输入。
+///
+/// # Safety
+/// `hwnd` 是主对话框，且目标下拉框已创建、网卡状态已采集。
+unsafe fn init_test_presets(hwnd: HWND) {
+    let h = GetDlgItem(Some(hwnd), IDC_TEST_TARGET as i32).unwrap_or_default();
+    if h.is_invalid() {
+        return;
+    }
+    let gateway = lock_state()
+        .nics
+        .iter()
+        .find(|n| !n.gateway.is_empty())
+        .map(|n| n.gateway.clone())
+        .unwrap_or_default();
+    for t in netctl::test_presets(&gateway) {
+        let w = wide(&t);
+        let _ = SendMessageW(h, CB_ADDSTRING, None, Some(LPARAM(w.as_ptr() as isize)));
+    }
+}
+
+/// 下拉框闭合高度由字体决定，与按钮的模板 DLU 高度不一致。
+/// 统一成 14 DLU 的像素高（MapDialogRect 随 DPI 换算）、顶边对齐，标签垂直居中。
+/// 下拉窗口总高按模板 DLU 保留（含列表），只改闭合选择区，避免列表被压扁。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+unsafe fn normalize_test_toolbar(hwnd: HWND) {
+    let map_h = |dlu: i32| -> Option<i32> {
+        unsafe {
+            let mut r = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: dlu,
+            };
+            MapDialogRect(hwnd, &mut r).ok()?;
+            Some(r.bottom)
+        }
+    };
+    let Some(h) = map_h(14) else {
+        return;
+    };
+    let Ok(run) = GetDlgItem(Some(hwnd), IDC_TEST_RUN as i32) else {
+        return;
+    };
+    let mut rr = RECT::default();
+    if GetWindowRect(run, &mut rr).is_err() {
+        return;
+    }
+    let mut pt = POINT {
+        x: rr.left,
+        y: rr.top,
+    };
+    if !ScreenToClient(hwnd, &mut pt).as_bool() {
+        return;
+    }
+    let y = pt.y;
+    let client_rect = |c: HWND| -> Option<(i32, i32, i32, i32)> {
+        unsafe {
+            let mut r = RECT::default();
+            GetWindowRect(c, &mut r).ok()?;
+            let mut p = POINT {
+                x: r.left,
+                y: r.top,
+            };
+            if !ScreenToClient(hwnd, &mut p).as_bool() {
+                return None;
+            }
+            Some((p.x, p.y, r.right - r.left, r.bottom - r.top))
+        }
+    };
+    // 下拉窗口总高按模板 DLU 保留（含列表），闭合选择区先设为 h。
+    for (id, total_dlu) in [(IDC_TEST_TARGET, 120), (IDC_TEST_KIND, 60)] {
+        if let Ok(c) = GetDlgItem(Some(hwnd), id as i32) {
+            if let (Some((x, _, w, _)), Some(total)) = (client_rect(c), map_h(total_dlu)) {
+                let _ = MoveWindow(c, x, y, w, total, true);
+            }
+            let _ = SendMessageW(
+                c,
+                CB_SETITEMHEIGHT,
+                Some(WPARAM(usize::MAX)),
+                Some(LPARAM(h as isize)),
+            );
+        }
+    }
+    // 闭合高度 = 选择区 + 边框，实测超出 h 的部分再扣掉，使下拉与按钮严格同高。
+    if let Ok(c) = GetDlgItem(Some(hwnd), IDC_TEST_TARGET as i32) {
+        if let Some((_, _, _, closed)) = client_rect(c) {
+            let delta = closed - h;
+            if delta != 0 {
+                for id in [IDC_TEST_TARGET, IDC_TEST_KIND] {
+                    if let Ok(cc) = GetDlgItem(Some(hwnd), id as i32) {
+                        let _ = SendMessageW(
+                            cc,
+                            CB_SETITEMHEIGHT,
+                            Some(WPARAM(usize::MAX)),
+                            Some(LPARAM((h - delta) as isize)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Some((x, _, w, _)) = client_rect(run) {
+        let _ = MoveWindow(run, x, y, w, h, true);
+    }
+    if let Ok(c) = GetDlgItem(Some(hwnd), IDC_TEST_LABEL as i32) {
+        if let Some((x, _, w, lh)) = client_rect(c) {
+            let _ = MoveWindow(c, x, y + (h - lh) / 2, w, lh, true);
+        }
+    }
 }
 
 /// 选到 Ipconfig 时目标框无意义，直接禁用。
@@ -1492,6 +1614,136 @@ pub unsafe fn show_popup_menu(hwnd: HWND, hl: HWND) {
         None,
     );
     let _ = DestroyMenu(hmenu);
+}
+
+/// WLAN 右键菜单项表：启用规则与详情对话框的复制按钮同一套。
+pub fn wlan_menu_spec(w: Option<&Wlan>) -> Vec<(u32, &'static str, bool)> {
+    let has = w.is_some();
+    let copyable = w.is_some_and(wifi::password_copyable);
+    vec![
+        (IDM_WLAN_DETAIL, "查看密码…", has),
+        (IDM_WLAN_COPY, "复制密码", copyable),
+        (IDM_WLAN_COPY_SSID, "复制名称", has),
+        (IDC_WLAN_REFRESH, "刷新", true),
+    ]
+}
+
+/// 右键先选中光标下的行（资源管理器习惯），再按该行状态弹菜单。
+/// 坐标取 WM_CONTEXTMENU 的 lparam（点击点），键盘触发 (-1,-1) 时退回光标位置。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+pub unsafe fn show_wlan_popup_menu(hwnd: HWND, lparam: LPARAM) {
+    let hl = wlan_list(hwnd);
+    if hl.is_invalid() {
+        return;
+    }
+    let mut pt = POINT {
+        x: (lparam.0 as u16 as i16) as i32,
+        y: ((lparam.0 >> 16) as u16 as i16) as i32,
+    };
+    if pt.x == -1 && pt.y == -1 {
+        let _ = GetCursorPos(&mut pt);
+    }
+    let mut client = pt;
+    if ScreenToClient(hl, &mut client).as_bool() {
+        let mut hit = LVHITTESTINFO {
+            pt: client,
+            ..Default::default()
+        };
+        let idx = SendMessageW(
+            hl,
+            LVM_HITTEST,
+            None,
+            Some(LPARAM(&mut hit as *mut _ as isize)),
+        )
+        .0 as i32;
+        if idx >= 0 {
+            select_row(hl, idx);
+        }
+    }
+    let picked = selected_index(hl).and_then(|i| lock_wlans().get(i).cloned());
+    let Ok(hmenu) = CreatePopupMenu() else {
+        set_status(hwnd, "创建右键菜单失败");
+        return;
+    };
+    for (id, label, usable) in wlan_menu_spec(picked.as_ref()) {
+        if id == IDC_WLAN_REFRESH {
+            let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+        }
+        let flags = if usable { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let text = wide(label);
+        let _ = AppendMenuW(hmenu, flags, id as usize, PCWSTR(text.as_ptr()));
+    }
+    let _ = TrackPopupMenu(
+        hmenu,
+        TPM_TOPALIGN | TPM_LEFTALIGN,
+        pt.x,
+        pt.y,
+        Some(0),
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(hmenu);
+}
+
+/// # Safety
+/// `hl` 是 WLAN 页 ListView。
+unsafe fn select_row(hl: HWND, idx: i32) {
+    let both = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+    let mut clear = LVITEMW {
+        mask: LVIF_STATE,
+        state: LIST_VIEW_ITEM_STATE_FLAGS(0),
+        stateMask: both,
+        ..Default::default()
+    };
+    let _ = SendMessageW(
+        hl,
+        LVM_SETITEMSTATE,
+        Some(WPARAM(usize::MAX)),
+        Some(LPARAM(&mut clear as *mut _ as isize)),
+    );
+    let mut set = LVITEMW {
+        mask: LVIF_STATE,
+        state: both,
+        stateMask: both,
+        ..Default::default()
+    };
+    let _ = SendMessageW(
+        hl,
+        LVM_SETITEMSTATE,
+        Some(WPARAM(idx as usize)),
+        Some(LPARAM(&mut set as *mut _ as isize)),
+    );
+}
+
+/// 右键「复制密码/复制名称」：结果走状态栏，剪贴板被占用时给人话提示。
+///
+/// # Safety
+/// `hwnd` 是主对话框。
+unsafe fn on_wlan_copy(hwnd: HWND, password: bool) {
+    let Some(w) = selected_index(wlan_list(hwnd)).and_then(|i| lock_wlans().get(i).cloned())
+    else {
+        set_status(hwnd, "未选择网络");
+        return;
+    };
+    let text = if password {
+        w.password.clone().unwrap_or_default()
+    } else {
+        w.ssid.clone()
+    };
+    if text.is_empty() {
+        set_status(hwnd, "该网络没有可复制的明文密码");
+        return;
+    }
+    if crate::forms::copy_to_clipboard(hwnd, &text) {
+        set_status(
+            hwnd,
+            &format!("已复制{}：{}", if password { "密码" } else { "名称" }, w.ssid),
+        );
+    } else {
+        set_status(hwnd, "复制失败：剪贴板被占用");
+    }
 }
 
 /// 禁用会不会切断当前默认路由 —— 需要用户确认的唯一条件。
@@ -1876,6 +2128,9 @@ pub unsafe fn layout(hwnd: HWND) {
         return;
     }
     let page = current_page();
+    if page == Page::Test {
+        normalize_test_toolbar(hwnd);
+    }
 
     let sb = status_bar(hwnd);
     let mut sb_height = 0;
@@ -2012,6 +2267,7 @@ pub unsafe extern "system" fn main_dlgproc(
             init_status_bar(hwnd);
             init_test_kind(hwnd);
             refresh_list(hwnd);
+            init_test_presets(hwnd);
             sync_buttons(hwnd, list_view(hwnd));
             apply_page(hwnd, Page::Nic);
             1
@@ -2035,6 +2291,13 @@ pub unsafe extern "system" fn main_dlgproc(
                 let _ = DeleteObject(HGDIOBJ(brush.0));
             }
             1
+        }
+        // 静态标签（如「目标」）默认灰底会在右对齐文字左侧留灰块；改白底透明 + 次强调字色。
+        WM_CTLCOLORSTATIC => {
+            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, theme::TEXT_DIM);
+            GetSysColorBrush(COLOR_WINDOW).0 as isize
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u32;
@@ -2063,6 +2326,9 @@ pub unsafe extern "system" fn main_dlgproc(
                 IDC_ROUTE_ADD => on_route_add(hwnd),
                 IDC_ROUTE_DEL => on_route_delete(hwnd),
                 IDC_WLAN_REFRESH => refresh_wlan(hwnd),
+                IDM_WLAN_DETAIL => on_wlan_activate(hwnd),
+                IDM_WLAN_COPY => on_wlan_copy(hwnd, true),
+                IDM_WLAN_COPY_SSID => on_wlan_copy(hwnd, false),
                 IDC_TEST_RUN => on_test_run(hwnd),
                 IDC_TEST_KIND if code == CBN_SELCHANGE => on_test_kind_changed(hwnd),
                 _ => return 0,
@@ -2079,7 +2345,11 @@ pub unsafe extern "system" fn main_dlgproc(
             1
         }
         WM_CONTEXTMENU => {
-            show_popup_menu(hwnd, list_view(hwnd));
+            match current_page() {
+                Page::Nic => show_popup_menu(hwnd, list_view(hwnd)),
+                Page::Wlan => show_wlan_popup_menu(hwnd, lparam),
+                _ => {}
+            }
             1
         }
         WM_NOTIFY => {
@@ -2688,6 +2958,59 @@ mod tests {
         assert!(s.contains("Ping 10.0.0.1"), "{s}");
         assert!(s.contains("完成"), "{s}");
         assert!(s.contains("Pinging 10.0.0.1"), "{s}");
+    }
+
+    /// 原始输出之外必须附解说，用户才能知道「这是什么问题」。
+    #[test]
+    fn report_appends_explanation_after_raw_output() {
+        let r = TestResult {
+            text: "丢失 = 0 (0% 丢失)，平均 = 0ms".into(),
+            code: Some(0),
+        };
+        let s = test_report(TestKind::Ping, "127.0.0.1", &r);
+        assert!(s.contains("【解说】"), "{s}");
+        assert!(s.contains("正常"), "{s}");
+        let raw = s.find("丢失 = 0").unwrap();
+        let exp = s.find("【解说】").unwrap();
+        assert!(raw < exp, "解说必须在原始输出之后");
+    }
+
+    /// 右键菜单启用规则与详情对话框的复制按钮同一套。
+    #[test]
+    fn wlan_menu_spec_enables_by_row_state() {
+        let w = Wlan {
+            ssid: "A".into(),
+            saved: true,
+            signal: None,
+            security: String::new(),
+            password: Some("pw".into()),
+        };
+        let enabled = |spec: &[(u32, &'static str, bool)], id: u32| {
+            spec.iter().find(|(i, _, _)| *i == id).unwrap().2
+        };
+        let spec = wlan_menu_spec(Some(&w));
+        assert!(enabled(&spec, IDM_WLAN_DETAIL));
+        assert!(enabled(&spec, IDM_WLAN_COPY));
+        assert!(enabled(&spec, IDM_WLAN_COPY_SSID));
+        assert!(enabled(&spec, IDC_WLAN_REFRESH));
+        let open = Wlan {
+            password: Some(String::new()),
+            ..w.clone()
+        };
+        assert!(!enabled(&wlan_menu_spec(Some(&open)), IDM_WLAN_COPY));
+        let enterprise = Wlan {
+            password: None,
+            ..w.clone()
+        };
+        assert!(!enabled(&wlan_menu_spec(Some(&enterprise)), IDM_WLAN_COPY));
+        let nearby = Wlan { saved: false, ..w };
+        let spec = wlan_menu_spec(Some(&nearby));
+        assert!(!enabled(&spec, IDM_WLAN_COPY));
+        assert!(enabled(&spec, IDM_WLAN_DETAIL));
+        let none = wlan_menu_spec(None);
+        assert!(!enabled(&none, IDM_WLAN_DETAIL));
+        assert!(!enabled(&none, IDM_WLAN_COPY_SSID));
+        assert!(enabled(&none, IDC_WLAN_REFRESH));
     }
 
     #[test]

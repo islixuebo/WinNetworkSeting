@@ -53,6 +53,14 @@ pub fn signal_text(signal: Option<u32>) -> String {
     }
 }
 
+/// 信号图标点亮格数（0–5）；未知信号全灰。
+pub fn signal_bars(signal: Option<u32>) -> u32 {
+    match signal {
+        Some(q) => (q.min(100) + 19) / 20,
+        None => 0,
+    }
+}
+
 pub fn password_text(w: &Wlan) -> String {
     if !w.saved {
         return "未保存，无密码".to_string();
@@ -61,6 +69,24 @@ pub fn password_text(w: &Wlan) -> String {
         Some("") => "（开放网络，无密码）".to_string(),
         Some(p) => p.to_string(),
         None => "（无明文密码，可能使用企业认证或证书）".to_string(),
+    }
+}
+
+/// 能否复制明文密码：已保存且有非空明文（开放网络、企业认证不行）。
+pub fn password_copyable(w: &Wlan) -> bool {
+    w.saved && matches!(w.password.as_deref(), Some(p) if !p.is_empty())
+}
+
+/// 密码区下方的操作提示，与密码状态一一对应。
+pub fn password_hint(w: &Wlan) -> &'static str {
+    if password_copyable(w) {
+        "点「复制密码」，或选中后按 Ctrl+C"
+    } else if !w.saved {
+        "附近网络未保存，无密码"
+    } else if matches!(w.password.as_deref(), Some("")) {
+        "开放网络，无需密码"
+    } else {
+        "企业认证网络，无明文密码"
     }
 }
 
@@ -518,6 +544,18 @@ mod tests {
     }
 
     #[test]
+    fn signal_bars_maps_quality_to_five_steps() {
+        assert_eq!(signal_bars(None), 0);
+        assert_eq!(signal_bars(Some(0)), 0);
+        assert_eq!(signal_bars(Some(1)), 1);
+        assert_eq!(signal_bars(Some(20)), 1);
+        assert_eq!(signal_bars(Some(21)), 2);
+        assert_eq!(signal_bars(Some(60)), 3);
+        assert_eq!(signal_bars(Some(100)), 5);
+        assert_eq!(signal_bars(Some(150)), 5);
+    }
+
+    #[test]
     fn merge_puts_saved_first_and_fills_signal() {
         let rows = merge_networks(
             vec![saved("Office", Some("secret")), saved("Home", Some("pw"))],
@@ -565,6 +603,25 @@ mod tests {
             "（无明文密码，可能使用企业认证或证书）"
         );
         assert_eq!(password_text(&nearby("B", 50)), "未保存，无密码");
+    }
+
+    #[test]
+    fn password_copyable_requires_saved_plaintext() {
+        assert!(password_copyable(&saved("A", Some("pw"))));
+        assert!(!password_copyable(&saved("A", Some(""))));
+        assert!(!password_copyable(&saved("A", None)));
+        assert!(!password_copyable(&nearby("B", 50)));
+    }
+
+    #[test]
+    fn password_hint_guides_each_state() {
+        assert_eq!(
+            password_hint(&saved("A", Some("pw"))),
+            "点「复制密码」，或选中后按 Ctrl+C"
+        );
+        assert_eq!(password_hint(&saved("A", Some(""))), "开放网络，无需密码");
+        assert_eq!(password_hint(&saved("A", None)), "企业认证网络，无明文密码");
+        assert_eq!(password_hint(&nearby("B", 50)), "附近网络未保存，无密码");
     }
 
     #[test]

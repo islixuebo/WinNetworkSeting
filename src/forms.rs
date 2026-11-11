@@ -4,8 +4,10 @@ use std::cell::RefCell;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, FillRect, GetSysColorBrush, SetBkMode, SetTextColor,
-    COLOR_WINDOW, HGDIOBJ, TRANSPARENT,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
+    GetSysColorBrush, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    COLOR_WINDOW, DEFAULT_CHARSET, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
+    DT_VCENTER, FW_SEMIBOLD, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -13,13 +15,15 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::UI::Controls::EM_SETSEL;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DialogBoxParamW, EndDialog, GetClientRect, GetDlgItem, GetWindowTextLengthW,
-    GetWindowTextW, MessageBoxW, SendMessageW, SetWindowTextW, BS_AUTOCHECKBOX, BS_GROUPBOX,
-    BS_PUSHBUTTON, CBS_DROPDOWNLIST, DLGPROC, ES_AUTOHSCROLL, ES_READONLY, HMENU, MB_ICONWARNING,
-    MB_OK, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC,
-    WM_ERASEBKGND, WM_INITDIALOG, WM_SETFONT, WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DialogBoxParamW, EndDialog, GetClientRect, GetDlgItem, GetDlgCtrlID, GetWindow,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, MessageBoxW, SendMessageW, SetWindowPos,
+    SetWindowTextW, BS_AUTOCHECKBOX, BS_GROUPBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST, DLGPROC,
+    ES_AUTOHSCROLL, ES_READONLY, GW_OWNER, HMENU, MB_ICONWARNING, MB_OK, SWP_NOZORDER,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC,
+    WM_ERASEBKGND, WM_INITDIALOG, WM_PAINT, WM_SETFONT, WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::netinfo::Nic;
@@ -789,6 +793,16 @@ const IDD_WLAN: u32 = 105;
 const WLAN_PASSWORD: u32 = 4300;
 const WLAN_COPY: u32 = 4301;
 const WLAN_HINT: u32 = 4302;
+const WLAN_SECURITY: u32 = 4303;
+const WLAN_LBL_SECURITY: u32 = 4304;
+const WLAN_LBL_PASSWORD: u32 = 4305;
+
+// 设计基准像素（96dpi，与 detail.rs 同一套固定尺寸语言）。
+// 头部整块自绘：大号 SSID + 信号格 + 百分比 + 类型胶囊；正文用真实控件；两道分隔线收边。
+const WLAN_W: i32 = 460;
+const WLAN_H: i32 = 266;
+const WLAN_M: i32 = 24;
+const WLAN_VAL_X: i32 = 120;
 
 thread_local! {
     static WLAN: RefCell<Option<Wlan>> = const { RefCell::new(None) };
@@ -812,24 +826,8 @@ pub fn wlan_detail_dialog(parent: HWND, w: &Wlan) {
     }
 }
 
-/// # Safety
-/// `parent` 必须是当前线程上存活、已创建的对话框；`id` 在同一个对话框内不能重复。
-unsafe fn add_readonly_edit(parent: HWND, x: i32, y: i32, w: i32, text: &str, id: u32) -> HWND {
-    create(
-        parent,
-        "EDIT",
-        text,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE((ES_AUTOHSCROLL | ES_READONLY) as u32),
-        x,
-        y,
-        w,
-        22,
-        id,
-    )
-}
-
 /// 写剪贴板：调用方保证 `text` 是用户明确要复制的密码。
-unsafe fn copy_to_clipboard(hwnd: HWND, text: &str) -> bool {
+pub(crate) unsafe fn copy_to_clipboard(hwnd: HWND, text: &str) -> bool {
     if OpenClipboard(Some(hwnd)).is_err() {
         return false;
     }
@@ -858,70 +856,284 @@ unsafe fn copy_to_clipboard(hwnd: HWND, text: &str) -> bool {
 }
 
 unsafe fn build_wlan_controls(hwnd: HWND, w: &Wlan) {
-    let mut rc = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rc);
-    let cx = (rc.right - rc.left).max(360);
-    let cy = (rc.bottom - rc.top).max(230);
-    let margin = 14;
-    let label_w = 72;
-    let value_x = margin + label_w;
-    let value_w = (cx - value_x - margin).max(180);
+    let m = WLAN_M;
+    let val_x = WLAN_VAL_X;
+    let val_w = WLAN_W - WLAN_M - val_x;
 
-    add_label(
-        hwnd,
-        margin,
-        12,
-        cx - margin * 2,
-        &format!("SSID：{}", w.ssid),
-    );
-    add_label(hwnd, margin, 40, label_w, "类型");
-    add_label(hwnd, value_x, 40, value_w, crate::wifi::type_text(w.saved));
-    add_label(hwnd, margin, 64, label_w, "信号");
-    add_label(
-        hwnd,
-        value_x,
-        64,
-        value_w,
-        &crate::wifi::signal_text(w.signal),
-    );
-    add_label(hwnd, margin, 88, label_w, "加密方式");
-    add_label(hwnd, value_x, 88, value_w, &w.security);
-    add_label(hwnd, margin, 118, label_w, "密码");
-    add_readonly_edit(
-        hwnd,
-        value_x,
-        114,
-        value_w,
-        &crate::wifi::password_text(w),
-        WLAN_PASSWORD,
-    );
-
-    let copyable = w.saved && matches!(w.password.as_deref(), Some(p) if !p.is_empty());
-    let copy = add_button(hwnd, value_x, 146, 90, "复制密码", WLAN_COPY);
-    if !copyable {
-        let _ = EnableWindow(copy, false);
-    }
+    // 加密方式：灰标签 + 深色值
     create(
         hwnd,
         "STATIC",
-        "",
+        "加密方式",
         WS_CHILD | WS_VISIBLE,
-        value_x + 100,
-        150,
-        (value_w - 100).max(0),
+        m,
+        108,
+        84,
+        22,
+        WLAN_LBL_SECURITY,
+    );
+    let sec = if w.security.trim().is_empty() {
+        "未知"
+    } else {
+        w.security.as_str()
+    };
+    create(
+        hwnd,
+        "STATIC",
+        sec,
+        WS_CHILD | WS_VISIBLE,
+        val_x,
+        108,
+        val_w,
+        22,
+        WLAN_SECURITY,
+    );
+
+    // 密码：灰标签 + 只读框 + 复制按钮
+    create(
+        hwnd,
+        "STATIC",
+        "密码",
+        WS_CHILD | WS_VISIBLE,
+        m,
+        144,
+        84,
+        22,
+        WLAN_LBL_PASSWORD,
+    );
+    create(
+        hwnd,
+        "EDIT",
+        &crate::wifi::password_text(w),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE((ES_AUTOHSCROLL | ES_READONLY) as u32),
+        val_x,
+        140,
+        208,
+        28,
+        WLAN_PASSWORD,
+    );
+    let copy = create(
+        hwnd,
+        "BUTTON",
+        "复制密码",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        340,
+        139,
+        96,
+        30,
+        WLAN_COPY,
+    );
+    if !crate::wifi::password_copyable(w) {
+        let _ = EnableWindow(copy, false);
+    }
+
+    // 操作提示（灰）
+    create(
+        hwnd,
+        "STATIC",
+        crate::wifi::password_hint(w),
+        WS_CHILD | WS_VISIBLE,
+        val_x,
+        174,
+        val_w,
         18,
         WLAN_HINT,
     );
-    add_button(hwnd, cx - margin - 90, cy - 38, 90, "关闭", 2);
+
+    // 关闭
+    create(
+        hwnd,
+        "BUTTON",
+        "关闭",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        340,
+        218,
+        96,
+        32,
+        2,
+    );
 }
 
-unsafe extern "system" fn wlan_proc(hwnd: HWND, msg: u32, wparam: WPARAM, _l: LPARAM) -> isize {
+/// 头部自绘：大号 SSID + 信号格 + 百分比 + 类型胶囊，再加两道分隔线收边。
+unsafe fn paint_wlan(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    if hdc.0.is_null() {
+        return;
+    }
+    let mut cr = RECT::default();
+    let _ = GetClientRect(hwnd, &mut cr);
+    let bg = CreateSolidBrush(theme::BG);
+    FillRect(hdc, &cr, bg);
+    let _ = DeleteObject(HGDIOBJ(bg.0));
+
+    let entry = WLAN.with(|s| s.borrow().clone());
+    let Some(w) = entry else {
+        let _ = EndPaint(hwnd, &ps);
+        return;
+    };
+    SetBkMode(hdc, TRANSPARENT);
+
+    // 大号 SSID 标题（半粗）
+    let title_font = create_title_font();
+    let old = SelectObject(hdc, HGDIOBJ(title_font.0));
+    SetTextColor(hdc, theme::TEXT);
+    let mut tr = RECT {
+        left: WLAN_M,
+        top: 16,
+        right: 300,
+        bottom: 48,
+    };
+    let mut tbuf: Vec<u16> = w.ssid.encode_utf16().collect();
+    DrawTextW(
+        hdc,
+        &mut tbuf,
+        &mut tr,
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
+    SelectObject(hdc, old);
+    let _ = DeleteObject(HGDIOBJ(title_font.0));
+
+    draw_signal(hdc, w.signal);
+
+    // 类型胶囊：已保存=蓝、附近=灰
+    let (fg, pill_bg) = theme::status_colors(w.saved, false);
+    let cell = RECT {
+        left: WLAN_M,
+        top: 54,
+        right: 224,
+        bottom: 82,
+    };
+    let old_font = SelectObject(hdc, HGDIOBJ(ui_font().0));
+    crate::ui::draw_status_pill(
+        hdc,
+        &cell,
+        theme::BG,
+        fg,
+        pill_bg,
+        crate::wifi::type_text(w.saved),
+    );
+    SelectObject(hdc, old_font);
+
+    draw_separator(hdc, 96);
+    draw_separator(hdc, 204);
+
+    let _ = EndPaint(hwnd, &ps);
+}
+
+/// 信号格（点亮=主题蓝、未点亮=浅灰）+ 右对齐的百分比与等级。
+unsafe fn draw_signal(hdc: HDC, signal: Option<u32>) {
+    let lit = crate::wifi::signal_bars(signal);
+    let on = theme::rgb(26, 95, 180);
+    let off = theme::rgb(224, 228, 234);
+    let base_y = 40;
+    let x0 = 310;
+    let bw = 6;
+    let gap = 3;
+    for i in 0..5u32 {
+        let h = 6 + i as i32 * 3;
+        let left = x0 + i as i32 * (bw + gap);
+        let r = RECT {
+            left,
+            top: base_y - h,
+            right: left + bw,
+            bottom: base_y,
+        };
+        let brush = CreateSolidBrush(if i < lit { on } else { off });
+        FillRect(hdc, &r, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+
+    let old = SelectObject(hdc, HGDIOBJ(ui_font().0));
+    SetTextColor(hdc, theme::TEXT_DIM);
+    let text = match signal {
+        Some(q) => format!("{}% {}", q.min(100), crate::wifi::signal_level(q.min(100))),
+        None => "—".to_string(),
+    };
+    let mut buf: Vec<u16> = text.encode_utf16().collect();
+    let mut r = RECT {
+        left: 364,
+        top: 20,
+        right: WLAN_W - WLAN_M,
+        bottom: 42,
+    };
+    DrawTextW(
+        hdc,
+        &mut buf,
+        &mut r,
+        DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX,
+    );
+    SelectObject(hdc, old);
+}
+
+unsafe fn draw_separator(hdc: HDC, y: i32) {
+    let r = RECT {
+        left: WLAN_M,
+        top: y,
+        right: WLAN_W - WLAN_M,
+        bottom: y + 1,
+    };
+    let brush = CreateSolidBrush(theme::rgb(232, 236, 242));
+    FillRect(hdc, &r, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+unsafe fn create_title_font() -> HFONT {
+    let face = wide("Segoe UI");
+    CreateFontW(
+        -21,
+        0,
+        0,
+        0,
+        FW_SEMIBOLD.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        0,
+        PCWSTR(face.as_ptr()),
+    )
+}
+
+/// 客户区固定 460×266 + 实测非客户区，再居中于父窗口（同 detail.rs 的量法）。
+unsafe fn resize_and_center(hwnd: HWND) {
+    let mut wr = RECT::default();
+    let mut cr = RECT::default();
+    if GetWindowRect(hwnd, &mut wr).is_err() || GetClientRect(hwnd, &mut cr).is_err() {
+        return;
+    }
+    let nc_w = (wr.right - wr.left) - (cr.right - cr.left);
+    let nc_h = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+    let w = WLAN_W + nc_w;
+    let h = WLAN_H + nc_h;
+    let mut x = wr.left;
+    let mut y = wr.top;
+    if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+        let mut or = RECT::default();
+        if GetWindowRect(owner, &mut or).is_ok() {
+            x = or.left + ((or.right - or.left) - w) / 2;
+            y = or.top + ((or.bottom - or.top) - h) / 2;
+        }
+    }
+    let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER);
+}
+
+unsafe extern "system" fn wlan_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
     match msg {
         WM_INITDIALOG => {
             crate::ui::set_title_icons(hwnd);
             let entry = WLAN.with(|s| s.borrow().clone());
             match entry {
-                Some(w) => build_wlan_controls(hwnd, &w),
+                Some(w) => {
+                    build_wlan_controls(hwnd, &w);
+                    if let Ok(hp) = GetDlgItem(Some(hwnd), WLAN_PASSWORD as i32) {
+                        SendMessageW(hp, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+                    }
+                    resize_and_center(hwnd);
+                }
                 None => {
                     let _ = EndDialog(hwnd, 0);
                 }
@@ -932,10 +1144,16 @@ unsafe extern "system" fn wlan_proc(hwnd: HWND, msg: u32, wparam: WPARAM, _l: LP
             fill_background(hwnd, wparam);
             1
         }
+        WM_PAINT => {
+            paint_wlan(hwnd);
+            0
+        }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, theme::TEXT);
+            let id = GetDlgCtrlID(HWND(lparam.0 as *mut core::ffi::c_void)) as u32;
+            let dim = matches!(id, WLAN_LBL_SECURITY | WLAN_LBL_PASSWORD | WLAN_HINT);
+            SetTextColor(hdc, if dim { theme::TEXT_DIM } else { theme::TEXT });
             GetSysColorBrush(COLOR_WINDOW).0 as isize
         }
         WM_COMMAND => {
